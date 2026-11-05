@@ -97,6 +97,16 @@ class _Display:
     def raise_topmost(self):
         pass
 
+    # The panel shows the pointer on open and gives it back on close.
+    def force_pointer_visible(self):
+        return True
+
+    def restore_pointer(self):
+        pass
+
+    def forget_pointer(self):
+        pass
+
     def draw_overlay(self, *a):
         pass
 

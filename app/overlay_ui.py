@@ -187,7 +187,7 @@ SECTION_TOP_GAP = 22
 #: segments, five cells are easier to hit than a knob is to drag, and the
 #: same ladder is what the automatic fit chooses from - one set of sizes,
 #: not two (user, 20.09).
-SCALE_STEPS = (0.8, 0.9, 1.0, 1.15, 1.3)
+SCALE_STEPS = (0.6, 0.7, 0.8, 0.9, 1.0, 1.15, 1.3)
 
 #: How far under the track the ruler sits. Named because the layout reserves
 #: the room and the drawer places the ticks, and a slider whose row is shorter
@@ -207,7 +207,9 @@ RADIUS = 10
 #: Redesign B (v2.6.0): the main page's four state tiles, the fold-out headers
 #: and the collapsed bar (C) that replaced mini mode.
 TILE_H = 60
-FOLD_H = 42
+#: How far a fold-out's card stands outside the controls it holds.
+FOLD_OUTSET = 10
+FOLD_H = 38
 BAR_H = 48
 
 FONT_SIZE = 17
@@ -390,6 +392,9 @@ class OverlayMenu:
             # report); the HUD pairs it with the network fps. None while off.
             "display_fps": None,
             "frame_generation": False,
+            "fg_match_screen": True,
+            # What the matcher runs now; None while it is off or still reading.
+            "fg_match": None,
             "frame_multiplier": 2,
             # The step the presenter really runs, when it differs from the
             # pick above (issue #100: a refused 4x steps down to 2x).
@@ -463,8 +468,23 @@ class OverlayMenu:
             # from this dict is dropped by set_state in silence, and the toggle
             # would draw as off while the opt-out was still in force.
             "keep_speed_when_hidden": True,
+            "menu_show_pointer": True,
             "fg_ui_protect": False,
             "dim_on_rebuild": True,
+            "interlace": False,
+            "window_upscale": False,
+            "interlace_blend": True,
+            "interlace_black": False,
+            "interlace_mode": "every",
+            "interlace_clean": False,
+            "colour": True,
+            "nr_hold_repeats": True,
+            "game_gpu_low": False,
+            "fps_show_rate": True,
+            "fps_show_latency": True,
+            "fps_show_gpu": True,
+            "lens_nr_only": False,
+            "colour_nr_only": False,
             "window_follow": False,
             "nr_preset": "default",
             "nr_presets": True,
@@ -1493,6 +1513,8 @@ class OverlayMenu:
                     tuple(splits)))
             cy += ctrl_h + hint_h + gap
 
+        open_fold: list = [None]
+
         def fold(key: str, label: str, summary: str) -> bool:
             """A fold-out header (redesign B). True while its block is open.
 
@@ -1503,13 +1525,27 @@ class OverlayMenu:
             nonlocal cy
             if not show:
                 return False
+            end_fold()
             is_open = key in self.folds
-            items.append(Item("fold", key,
-                              pygame.Rect(pad, cy, inner_w, self._u(FOLD_H)),
-                              value=1.0 if is_open else 0.0,
-                              extra={"label": label, "summary": summary}))
-            cy += self._u(FOLD_H) + (self._u(12) if is_open else 0)
+            head = Item("fold", key,
+                        pygame.Rect(pad, cy, inner_w, self._u(FOLD_H)),
+                        value=1.0 if is_open else 0.0,
+                        extra={"label": label, "summary": summary})
+            items.append(head)
+            cy += self._u(FOLD_H) + (self._u(12) if is_open else self._u(6))
+            if is_open:
+                open_fold[0] = head
             return is_open
+
+        def end_fold() -> None:
+            """Close the open block: its frame ends here, under its last control."""
+            nonlocal cy
+            head = open_fold[0]
+            if head is None:
+                return
+            open_fold[0] = None
+            head.extra["body_h"] = cy - head.rect.bottom
+            cy += self._u(14)
 
         # The windows page: the full list of capturable windows, one row per
         # window. Hovering a row highlights the real window's outline on the
@@ -1897,6 +1933,10 @@ class OverlayMenu:
             # anyway, which is what a real-time overlay needs and what costs
             # battery and heat. On by default: the report came from someone who
             # minimised the program expecting it to keep working.
+            toggle("menu_show_pointer",
+                   s.get("menu_show_pointer", "Show the mouse when the panel opens"),
+                   self.state.get("menu_show_pointer", True) is not False,
+                   hint=s.get("menu_show_pointer_hint", ""))
             toggle("keep_speed_when_hidden",
                    s.get("keep_speed_when_hidden", "Keep full speed when hidden"),
                    bool(self.state.get("keep_speed_when_hidden", True)),
@@ -2060,49 +2100,44 @@ class OverlayMenu:
             multiplier = int(self.state.get("frame_multiplier", 2))
             boost = bool(self.state.get("nr_small"))
             lens_on = bool(self.state.get("lens"))
+            colour_on = self.state.get("colour", True) is not False
+            fps_on = str(self.state.get("fps_overlay", "off")) != "off"
+            theme_now = str(self.state.get("theme", "light"))
+            if theme_now not in THEME_NAMES:
+                theme_now = "light"
             on_s = s.get("tile_on", "On")
             off_s = s.get("tile_off", "Off")
             tile_gap = self._u(8)
             tile_h = self._u(TILE_H)
+            interlace_tile = bool(self.state.get("interlace", False))
             tiles = (("nr", "NR", on_s if nr_on else off_s, nr_on),
-                     ("frame_generation", "FG",
-                      f"×{multiplier}" if fg else off_s, fg),
                      ("boost", s["boost"], on_s if boost else off_s, boost),
-                     ("lens", s["lens"], on_s if lens_on else off_s, lens_on))
-            tile_w = (inner_w - tile_gap * (len(tiles) - 1)) // len(tiles)
+                     ("interlace", s.get("fold_interlace", "Interlace"),
+                      on_s if interlace_tile else off_s, interlace_tile),
+                     ("frame_generation", "FG",
+                      f"×{(self.state.get('fg_match') or {}).get('multiplier', multiplier)}"
+                      if fg else off_s, fg),
+                     ("lens", s["lens"], on_s if lens_on else off_s, lens_on),
+                     ("colour", s.get("fold_colour", "Colour"),
+                      on_s if colour_on else off_s, colour_on),
+                     # Not on or off: each click takes the next theme.
+                     ("theme", s["theme"], s[f"theme_{theme_now}"], theme_now != "light"),
+                     ("fps_overlay", "FPS", on_s if fps_on else off_s, fps_on))
+            # Rows of three: six in one row clip "Fotocamera" and "Contraste".
+            per_row = 3
+            tile_w = (inner_w - tile_gap * (per_row - 1)) // per_row
             for idx, (key, label, value_text, on) in enumerate(tiles):
-                tx = pad + idx * (tile_w + tile_gap)
-                w_here = (pad + inner_w - tx if idx == len(tiles) - 1 else tile_w)
+                col = idx % per_row
+                tx = pad + col * (tile_w + tile_gap)
+                w_here = (pad + inner_w - tx if col == per_row - 1 else tile_w)
+                ty = cy + (idx // per_row) * (tile_h + tile_gap)
                 items.append(Item("tile", key,
-                                  pygame.Rect(tx, cy, w_here, tile_h),
+                                  pygame.Rect(tx, ty, w_here, tile_h),
                                   value=1.0 if on else 0.0,
                                   extra={"label": label,
                                          "value_text": value_text}))
-            cy += tile_h + gap
-
-            # The multiplier, always on screen: a preference for the next
-            # attempt as much as a live control. A step picked with FG off
-            # turns it on (commands.apply_menu_action) - one click, and a
-            # 40-series card that steps down is never stranded behind the tile.
-            live = self.state.get("frame_multiplier_active")
-            fg_hint = ""
-            if fg and isinstance(live, int) and live != multiplier:
-                fg_hint = s.get(
-                    "fg_capped",
-                    "the runtime caps this card at x{live} - FG runs there, "
-                    "your x{want} is asked for again on the next attempt"
-                ).format(live=live, want=multiplier)
-            # Named "DLSS 4.5 FG", not "Frame multiplier": five cells leave
-            # 251 px for the caption, and the translated word needs up to 288
-            # (es) - test_fg_row_fits measures it in every language.
-            toggle("frame_multiplier", "DLSS 4.5 FG",
-                   fg, hint=fg_hint, segments_only=True,
-                   inline_right=[(f"frame_multiplier:{m}", f"×{m}")
-                                 for m in range(2, FG_MULTIPLIER_MAX + 1)])
-            steps = list(range(2, FG_MULTIPLIER_MAX + 1))
-            first = len(items) - len(steps)
-            for idx, value in enumerate(steps):
-                items[first + idx].extra["filled"] = fg and multiplier == value
+            rows = (len(tiles) + per_row - 1) // per_row
+            cy += rows * tile_h + (rows - 1) * tile_gap + gap
 
             # What the picture looks like: the profile, and how strongly.
             choice("profile", s["profile"], str(self.state.get("profile", "")),
@@ -2128,6 +2163,90 @@ class OverlayMenu:
 
             param_slider("intensity")
 
+            match = self.state.get("fg_match") or None
+            fg_summary = off_s
+            if fg:
+                fg_summary = f"×{match['multiplier']} · {match['refresh']} Hz" if match else f"×{multiplier}"
+            if fold("fg", s.get("frame_generation", "DLSS Frame Generation"), fg_summary):
+                # A step picked with FG off turns it on (commands.apply_menu_action).
+                live = self.state.get("frame_multiplier_active")
+                fg_hint = ""
+                # Under the matcher a step below the pick is its choice, not a cap.
+                if fg and isinstance(live, int) and live != multiplier and match is None:
+                    fg_hint = s.get(
+                        "fg_capped",
+                        "the runtime caps this card at x{live} - FG runs there, "
+                        "your x{want} is asked for again on the next attempt"
+                    ).format(live=live, want=multiplier)
+                # Named "DLSS 4.5 FG", not "Frame multiplier": five cells leave
+                # 251 px for the caption, and the translated word needs up to 288
+                # (es) - test_fg_row_fits measures it in every language.
+                toggle("frame_multiplier", "DLSS 4.5 FG",
+                       fg, hint=fg_hint, segments_only=True,
+                       inline_right=[(f"frame_multiplier:{m}", f"×{m}")
+                                     for m in range(2, FG_MULTIPLIER_MAX + 1)])
+                steps = list(range(2, FG_MULTIPLIER_MAX + 1))
+                first = len(items) - len(steps)
+                for idx, value in enumerate(steps):
+                    items[first + idx].extra["filled"] = fg and multiplier == value
+                match_hint = s.get("fg_match_screen_hint", "")
+                if match and match.get("real"):
+                    match_hint = (f"{match['real']} × {match['multiplier']} = "
+                                  f"{match['real'] * match['multiplier']} | {match['refresh']} Hz")
+                toggle("fg_match_screen", s.get("fg_match_screen", "Match the screen"),
+                       self.state.get("fg_match_screen", True) is not False,
+                       hint=match_hint)
+                # FG's interface protection (v2.6.0): the real frame's pixels
+                # where a still HUD sits over a moving picture. Off by default
+                # until it is measured on more games.
+                toggle("fg_ui_protect", s.get("fg_ui_protect", "Protect the interface in FG"),
+                       bool(self.state.get("fg_ui_protect", False)),
+                       hint=s.get("fg_ui_protect_hint", ""))
+            interlace_on = bool(self.state.get("interlace", False))
+            interlace_summary = off_s
+            if interlace_on:
+                mode_key = str(self.state.get("interlace_mode", "every"))
+                interlace_summary = {"every": s.get("interlace_every", "Every frame"),
+                                     "half": s.get("interlace_half", "Half-rate"),
+                                     "alternate": s.get("interlace_alternate", "Alternating")
+                                     }.get(mode_key, mode_key)
+            if fold("interlace", s.get("fold_interlace", "Interlace"), interlace_summary):
+                # Two passes woven line by line with NR on, Boost or not.
+                toggle("interlace", s.get("interlace", "Interlace the screen"),
+                       bool(self.state.get("interlace", False)),
+                       hint=s.get("interlace_hint", ""))
+                if self.state.get("interlace", False):
+                    interlace_mode = str(self.state.get("interlace_mode", "every"))
+                    segmented("interlace_mode", s.get("interlace_mode", "NR runs"), interlace_mode,
+                              ["every", "half", "alternate"],
+                              labels=[s.get("interlace_every", "Every frame"),
+                                      s.get("interlace_half", "Half-rate"),
+                                      s.get("interlace_alternate", "Alternating")])
+                    # Half-rate has one result: no rows to blend, nothing woven to clean.
+                    if interlace_mode != "half":
+                        toggle("interlace_clean", s.get("interlace_clean", "Third pass"),
+                               bool(self.state.get("interlace_clean", False)),
+                               hint=s.get("interlace_clean_hint", ""))
+                        toggle("interlace_blend", s.get("interlace_blend", "Blend the rows"),
+                               self.state.get("interlace_blend", True) is not False,
+                               hint=s.get("interlace_blend_hint", ""))
+                    toggle("interlace_black", s.get("interlace_black", "Show black lines"),
+                           bool(self.state.get("interlace_black", False)),
+                           hint=s.get("interlace_black_hint", ""))
+
+            # The frame counter: where it sits, and what it shows.
+            fps_corner = str(self.state.get("fps_overlay", "off"))
+            corner_marks = {"tl": "\u2196", "tr": "\u2197", "bl": "\u2199", "br": "\u2198"}
+            if fold("fps", "FPS", corner_marks.get(fps_corner, off_s)):
+                segmented("fps_overlay", s.get("fps_overlay", "Frame counter"), fps_corner,
+                          ["off", "tl", "tr", "bl", "br"],
+                          labels=["\u2014", "\u2196", "\u2197", "\u2199", "\u2198"])
+                for show_key, fallback in (("fps_show_rate", "Frame rate"),
+                                           ("fps_show_latency", "Latency"),
+                                           ("fps_show_gpu", "GPU usage")):
+                    toggle(show_key, s.get(show_key, fallback),
+                           self.state.get(show_key, True) is not False)
+
             # The fold-outs. Each header carries a summary of what it holds.
             limit_mode = str(self.state.get("frame_limit_mode", "unlimited"))
             custom_fps = int(self.state.get("frame_limit_custom", 90))
@@ -2139,17 +2258,17 @@ class OverlayMenu:
             net_bits = []
             if boost:
                 net_bits.append(str(self.state.get("work_size") or ""))
-                if passes_now > 1:
+                if passes_now > 1 and not self.state.get("interlace", False):
                     net_bits.append(f"{s.get('nr_passes', 'NR passes')} {passes_now}")
             net_bits.append(limit_labels.get(limit_mode, limit_mode))
             if fold("net", s.get("fold_net", "Network"),
                     " · ".join(b for b in net_bits if b)):
-                # FG's interface protection (v2.6.0): the real frame's pixels
-                # where a still HUD sits over a moving picture. Off by default
-                # until it is measured on more games.
-                toggle("fg_ui_protect", s.get("fg_ui_protect", "Protect the interface in FG"),
-                       bool(self.state.get("fg_ui_protect", False)),
-                       hint=s.get("fg_ui_protect_hint", ""))
+                toggle("game_gpu_low", s.get("game_gpu_low", "Put NR ahead of the game"),
+                       bool(self.state.get("game_gpu_low", False)),
+                       hint=s.get("game_gpu_low_hint", ""))
+                toggle("nr_hold_repeats", s.get("nr_hold_repeats", "Match game frames"),
+                       self.state.get("nr_hold_repeats", True) is not False,
+                       hint=s.get("nr_hold_repeats_hint", ""))
                 # The hint says what the cap counts: source frames, which is
                 # why a 60 cap and a 170 fps FG reading are true together (#109).
                 choice("frame_limit_mode", s.get("frame_limit", "Frame limit"),
@@ -2173,28 +2292,32 @@ class OverlayMenu:
                     lo = float(self.state.get("work_scale_min", 0.1))
                     slider("nr_res", lo, cap, pos, s["nr_res"],
                            value_text=work if work else f"{pos:.2f}")
-                    segmented("nr_passes", s.get("nr_passes", "NR passes"),
-                              str(max(1, min(4, passes_now))),
-                              ["1", "2", "3", "4"], labels=["1", "2", "3", "4"])
-                    items[-1].extra["state_default"] = "1"
-                    per_pass = self.state.get("nr_pass_params") or {}
-                    if passes_now >= 2:
-                        toggle("pass_params", s.get("pass_params", "Own set"),
-                               bool(per_pass), s.get("pass_params_hint", ""))
-                        if per_pass:
-                            segmented("pass_style", s["style"],
-                                      str(int(per_pass.get("style", 1))),
-                                      ["0", "1", "2"],
-                                      labels=[s["style_0"], s["style_1"],
-                                              s["style_2"]])
-                            pdefaults = self.state.get("pass_param_defaults") or {}
-                            pranges = self.state.get("pass_param_ranges") or {}
-                            for key in PARAM_KEYS:
-                                lo, hi = pranges.get(key) or PARAM_FALLBACK
-                                val = float(per_pass.get(key, 0.0))
-                                slider(f"pass_{key}", float(lo), float(hi), val,
-                                       s[key], value_text=f"{val:.2f}",
-                                       mark=pdefaults.get(key))
+                    # Interlacing has its own count: "NR runs" sets it.
+                    if not self.state.get("interlace", False):
+                        segmented("nr_passes", s.get("nr_passes", "NR passes"),
+                                  str(max(1, min(4, passes_now))),
+                                  ["1", "2", "3", "4"], labels=["1", "2", "3", "4"])
+                        items[-1].extra["state_default"] = "1"
+                # A second pass to give its own set: the cascade's, under Boost, or
+                # interlacing's, with or without it. Half-rate has only the one.
+                per_pass = self.state.get("nr_pass_params") or {}
+                if passes_now >= 2 and (boost or self.state.get("interlace", False)):
+                    toggle("pass_params", s.get("pass_params", "Own set"),
+                           bool(per_pass), s.get("pass_params_hint", ""))
+                    if per_pass:
+                        segmented("pass_style", s["style"],
+                                  str(int(per_pass.get("style", 1))),
+                                  ["0", "1", "2"],
+                                  labels=[s["style_0"], s["style_1"],
+                                          s["style_2"]])
+                        pdefaults = self.state.get("pass_param_defaults") or {}
+                        pranges = self.state.get("pass_param_ranges") or {}
+                        for key in PARAM_KEYS:
+                            lo, hi = pranges.get(key) or PARAM_FALLBACK
+                            val = float(per_pass.get(key, 0.0))
+                            slider(f"pass_{key}", float(lo), float(hi), val,
+                                   s[key], value_text=f"{val:.2f}",
+                                   mark=pdefaults.get(key))
 
             style_now = int(self.state.get("style", 1))
             if fold("tune", s.get("fold_tune", "Fine tuning"),
@@ -2254,6 +2377,9 @@ class OverlayMenu:
             # on/off is the tile; the block holds what it does, and can be set
             # up before it is turned on.
             if fold("camera", s["lens"], on_s if lens_on else off_s):
+                toggle("lens_nr_only", s.get("nr_only", "Only with NR"),
+                       bool(self.state.get("lens_nr_only", False)),
+                       hint=s.get("nr_only_hint", ""))
                 bend = self.state.get("lens_bend", True) is not False
                 toggle("lens_bend", s["lens_bend"], bend)
                 if bend:
@@ -2277,6 +2403,9 @@ class OverlayMenu:
             if fold("colour", s.get("fold_colour", "Colour"),
                     s.get("colour_changed", "Changed: {n}").format(n=changed) if changed
                     else s.get("colour_as_is", "As it is")):
+                toggle("colour_nr_only", s.get("nr_only", "Only with NR"),
+                       bool(self.state.get("colour_nr_only", False)),
+                       hint=s.get("nr_only_hint", ""))
                 for key in COLOUR_KEYS:
                     amount = float(self.state.get(key, 0.0))
                     slider(key, -1.0, 1.0, amount, s[key],
@@ -2295,6 +2424,11 @@ class OverlayMenu:
                           height=act_h)
                 # Which window, only in window mode; clicking it opens the list.
                 if in_window:
+                    # A game in a small window renders fewer pixels; this fills the
+                    # screen with it (app/window_scale.py keeps the mouse on it).
+                    toggle("window_upscale", s.get("window_upscale", "Enlarge window to screen"),
+                           bool(self.state.get("window_upscale", False)),
+                           hint=s.get("window_upscale_hint", ""))
                     current = _window_record(self.state.get("window_current"))
                     items.append(Item("info", "source_now",
                                       pygame.Rect(pad, cy, inner_w, self._u(LABEL_H)),
@@ -2322,6 +2456,7 @@ class OverlayMenu:
                 slider("split", 0.0, 1.0, split_val, s["split"],
                        hint=s["split_hint"], ticks=11,
                        value_text=f"{int(round(split_val * 100))}%")
+            end_fold()
             cy += self._u(10)
             progress = self.state.get("convert_progress")
             convert_label = s.get("convert", "Convert")
@@ -3109,6 +3244,11 @@ class OverlayMenu:
             if value in ("all", "errors", "none"):
                 self.state["notifications"] = value
                 return [("notifications", value)]
+            return []
+        if key == "interlace_mode":
+            if value in ("every", "half", "alternate"):
+                self.state["interlace_mode"] = value
+                return [("interlace_mode", value)]
             return []
         if key == "fps_overlay":
             if value in ("off", "tl", "tr", "bl", "br"):
@@ -4761,9 +4901,13 @@ class OverlayMenu:
         fg = bool(self.state.get("frame_generation"))
         multiplier = int(self.state.get("frame_multiplier", 2))
         tiles = (("nr", "NR", bool(self.state.get("nr"))),
-                 ("frame_generation", f"FG ×{multiplier}" if fg else "FG", fg),
+                 ("frame_generation",
+                  f"FG ×{(self.state.get('fg_match') or {}).get('multiplier', multiplier)}"
+                  if fg else "FG", fg),
                  ("boost", s["boost"], bool(self.state.get("nr_small"))),
-                 ("lens", s["lens"], bool(self.state.get("lens"))))
+                 ("lens", s["lens"], bool(self.state.get("lens"))),
+                 ("colour", s.get("fold_colour", "Colour"),
+                  self.state.get("colour", True) is not False))
         items: list[Item] = []
         x = edge + handle_w + gap
         for key, label, on in tiles:
@@ -4902,26 +5046,39 @@ class OverlayMenu:
                              item.rect.bottom - self._u(8) - value.get_height()))
 
     def _draw_fold(self, surface, item: Item, s: dict) -> None:
-        """A fold-out header: a hairline, the name, what it holds, a chevron."""
+        """A fold-out as a card: a closed one is a filled bar with the name, what
+        it holds and a chevron; an open one has a solid accent header and a frame
+        around its controls, so the eye can see where each group ends."""
         rect = item.rect
         is_open = item.value > 0.5
         hot = self.hover == f"fold:{item.key}"
-        if hot:
-            pygame.draw.rect(surface, _rgb(self.c["surface"]), rect,
-                             border_radius=self._u(4))
-        pygame.draw.line(surface, _rgb(self.c["border"]),
-                         (rect.x, rect.y), (rect.right, rect.y), max(1, self._u(1)))
+        # The controls span the content width; the card stands a little outside.
+        out = self._u(FOLD_OUTSET)
+        card = pygame.Rect(rect.x - out, rect.y, rect.w + 2 * out, rect.h)
+        radius = self._u(6)
+        line = max(1, self._u(1))
+        if is_open:
+            body_h = int(item.extra.get("body_h", 0))
+            frame = pygame.Rect(card.x, card.y, card.w, card.h + body_h + self._u(6))
+            pygame.draw.rect(surface, _rgb(self.c["accent"]), frame, line,
+                             border_radius=radius)
+            pygame.draw.rect(surface, _rgb(self.c["accent"]), card,
+                             border_top_left_radius=radius, border_top_right_radius=radius)
+        else:
+            pygame.draw.rect(surface, _rgb(self.c["surface"]), card, border_radius=radius)
+            pygame.draw.rect(surface, _rgb(self.c["accent"] if hot else self.c["border"]),
+                             card, line, border_radius=radius)
+        ink = self.c["bg"] if is_open else self.c["accent"] if hot else self.c["text"]
         inset = self._u(4)
         label = self._clip(self._font, str(item.extra.get("label", item.key)),
-                           _rgb(self.c["accent"] if hot else self.c["text"]),
-                           rect.w // 2)
+                           _rgb(ink), rect.w // 2)
         surface.blit(label, (rect.x + inset,
                              rect.centery - label.get_height() // 2))
         # The chevron: pointing right while closed, down while open.
         cx, cy = rect.right - self._u(10), rect.centery
         d = self._u(4)
         lw = max(2, self._u(2))
-        tone = _rgb(self.c["muted"])
+        tone = _rgb(self.c["bg"] if is_open else self.c["muted"])
         if is_open:
             pygame.draw.lines(surface, tone, False,
                               [(cx - d, cy - d // 2), (cx, cy + d // 2),
@@ -4935,8 +5092,7 @@ class OverlayMenu:
             room = (cx - self._u(14)) - (rect.x + inset + label.get_width()
                                          + self._u(16))
             if room > self._u(24):
-                img = self._clip(self._small_font, summary,
-                                 _rgb(self.c["muted"]), room)
+                img = self._clip(self._small_font, summary, tone, room)
                 surface.blit(img, (cx - self._u(14) - img.get_width(),
                                    rect.centery - img.get_height() // 2))
 

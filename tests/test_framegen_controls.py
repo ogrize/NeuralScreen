@@ -25,6 +25,7 @@ from test_ui_buttons import build, find, paint, click
 def main():
     pygame.init()
     menu = build()
+    menu.folds = set(menu.folds) | {"fg"}  # the multiplier row lives in its own fold-out
     paint(menu)
     assert find(menu, "slider", "frame_multiplier") is None
     # v2.6.0: FG is a tile (on/off) and the multiplier its own row of steps.

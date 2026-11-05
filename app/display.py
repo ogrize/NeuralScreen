@@ -176,12 +176,12 @@ def describe_window(hwnd) -> str:
 
 
 def system_cursor_visible() -> bool:
-    """Is there a mouse pointer on screen right now? (Nothing uses this yet.)
+    """Is there a mouse pointer on screen right now?
 
-    Kept for the open problem it belongs to: a fullscreen game hides the
-    cursor and our menu is then unusable. Drawing our own pointer was tried
-    and reverted - it produced a SECOND pointer in real use, which is worse
-    than none. See "The menu pointer is missing or frozen" in the README.
+    A fullscreen game hides the cursor and our menu is then unusable, so
+    force_pointer_visible asks this. Drawing our own pointer was tried and
+    reverted - it produced a SECOND pointer in real use, which is worse than
+    none. See "The menu pointer is missing or frozen" in the README.
 
     A fullscreen game hides it (ShowCursor(FALSE) on its own input queue) and
     it stays hidden while our menu is up. When it is gone the overlay draws
@@ -197,7 +197,8 @@ def system_cursor_visible() -> bool:
             return True
     except Exception:
         return True
-    return bool(ci.flags & CURSOR_SHOWING)
+    # A null shape is hidden as well: SetCursor(NULL) leaves the flag set.
+    return bool(ci.flags & CURSOR_SHOWING) and bool(ci.hCursor)
 
 # DPI-aware BEFORE import pygame: on load SDL freezes the process awareness,
 # and a later SetProcessDpiAwarenessContext no longer takes effect (it returns
@@ -218,6 +219,7 @@ except Exception:
 import numpy as np
 import pygame
 
+import badge as badge_channel
 import fonts
 import vdesk
 from overlay_ui import (OverlayMenu, palette as ui_palette,
@@ -922,6 +924,83 @@ class Display:
         if want != self._bar_input:
             self._bar_input = want
             self.set_menu_input(want == "mouse", activate=False)
+
+    def force_pointer_visible(self) -> bool:
+        """Bring the pointer back for the panel a game has hidden it from.
+
+        A game hides the pointer on its own input queue and may confine it, and
+        that holds until another window takes the foreground, so the panel takes
+        it here: the same activation as a first click, only earlier. A pointer
+        left over a part of the game the layer lets through is still the game's
+        to hide, and only then is it moved onto the panel. Call this for an open
+        the user asked for, never for a rebuild's: those re-stole the focus
+        (see set_menu_input). True when the pointer shows.
+        """
+        try:
+            hwnd = int(pygame.display.get_wm_info()["window"])
+        except Exception as exc:
+            print(f"Display: no hwnd to show the pointer on: {exc}", file=sys.stderr)
+            return system_cursor_visible()
+        self._remember_pointer()
+        user32.ClipCursor(None)
+        foreground = int(user32.GetForegroundWindow() or 0)
+        if foreground != hwnd:
+            # The foreground lock lets the foreground's own input queue through.
+            theirs = user32.GetWindowThreadProcessId(ctypes.c_void_p(foreground), None)
+            mine = ctypes.windll.kernel32.GetCurrentThreadId()
+            attached = bool(theirs) and bool(user32.AttachThreadInput(mine, theirs, True))
+            user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+            if attached:
+                user32.AttachThreadInput(mine, theirs, False)
+
+        def shows() -> bool:
+            for _ in range(6):
+                pygame.event.pump()
+                if system_cursor_visible():
+                    return True
+                time.sleep(0.01)
+            return False
+
+        if shows():
+            return True
+        panel = self.menu.panel_rect
+        if panel.width <= 0 or panel.height <= 0:
+            return False
+        ox, oy = getattr(self, "_origin", (0, 0))
+        user32.SetCursorPos(ox + panel.centerx, oy + panel.centery)
+        return shows()
+
+    def _remember_pointer(self) -> None:
+        """Where the game kept a pointer it hid or confined, for the close.
+
+        A pointer that shows and roams free is the user's own and is left
+        wherever they take it (#96), so nothing is remembered for it.
+        """
+        self._pointer_home = None
+        where, clip = wintypes.POINT(), wintypes.RECT()
+        if (not user32.GetCursorPos(ctypes.byref(where))
+                or not user32.GetClipCursor(ctypes.byref(clip))):
+            return
+        desktop = (user32.GetSystemMetrics(76), user32.GetSystemMetrics(77),
+                   user32.GetSystemMetrics(78), user32.GetSystemMetrics(79))
+        confined = ((clip.left, clip.top, clip.right - clip.left, clip.bottom - clip.top)
+                    != desktop)
+        if confined or not system_cursor_visible():
+            self._pointer_home = ((where.x, where.y), clip if confined else None)
+
+    def restore_pointer(self) -> None:
+        """Give the game its pointer back where force_pointer_visible found it."""
+        home, self._pointer_home = getattr(self, "_pointer_home", None), None
+        if home is None:
+            return
+        (x, y), clip = home
+        user32.SetCursorPos(x, y)
+        if clip is not None:
+            user32.ClipCursor(ctypes.byref(clip))
+
+    def forget_pointer(self) -> None:
+        """The user went to another window: the pointer is not the game's now."""
+        self._pointer_home = None
 
     def apply_menu_mode_input(self) -> None:
         """The input the menu takes in its current form, once it is up.
@@ -2528,12 +2607,30 @@ class Display:
         """
         corner = str(self._hud.get("fps_overlay") or "off")
         sink = self.badge_out
-        readings = (status_readings(self.menu.state, self._hud,
-                                    STRINGS.get(self._lang, STRINGS["en"]))
-                    if corner in self.BADGE_CORNERS and not self.menu.visible
-                    else [])
-        # Off, the menu open (the panel shows the same numbers, one line up),
-        # or nothing running: no badge.
+        strings = STRINGS.get(self._lang, STRINGS["en"])
+        readings = (status_readings(self.menu.state, self._hud, strings)
+                    if corner in self.BADGE_CORNERS else [])
+        # With NR off there is no NR rate to read: what the program is putting on
+        # the screen. While it rests it adds no latency and shows nothing at all.
+        if corner in self.BADGE_CORNERS and not readings:
+            output = self._hud.get("output_fps")
+            if isinstance(output, (int, float)) and output > 0:
+                readings = [f"{strings.get('fps_output', 'Output')} {output:.1f}"]
+        if not readings:
+            if sink is not None:
+                sink.hide()
+            return
+        # The rate decides whether there is anything to show; the FPS fold
+        # decides which readings are on it.
+        if self._hud.get("fps_show_rate", True) is False:
+            readings = []
+        # The badge's alone: the status line has no room for one more reading.
+        latency = self._hud.get("latency_ms")
+        if isinstance(latency, (int, float)) and self._hud.get("fps_show_latency", True) is not False:
+            readings = readings + [f"{strings.get('latency_short', 'Latency')} {latency:.0f} ms"]
+        gpu_percent = self._hud.get("gpu_percent")
+        if isinstance(gpu_percent, (int, float)) and self._hud.get("fps_show_gpu", True) is not False:
+            readings = readings + [f"GPU {gpu_percent:.0f}%"]
         if not readings:
             if sink is not None:
                 sink.hide()
@@ -2560,6 +2657,12 @@ class Display:
             pygame.draw.rect(badge, self._rgb(self.theme["border"]), box,
                              max(1, int(round(self.ui_scale))), border_radius=radius)
             badge.blit(surf, (pad_x, pad_y))
+            # The shared bitmap has a fixed width, and the channel cuts anything
+            # wider at the wrong row length, which shears the picture.
+            if w > badge_channel.WIDTH:
+                h = max(1, h * badge_channel.WIDTH // w)
+                w = badge_channel.WIDTH
+                badge = pygame.transform.smoothscale(badge, (w, h))
             margin = int(round(14 * self.ui_scale))
             step = (h + int(round(8 * self.ui_scale))) * row
             sink.publish(pygame.image.tobytes(badge, "RGBA_PREMULT"), w, h,

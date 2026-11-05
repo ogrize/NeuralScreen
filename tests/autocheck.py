@@ -486,12 +486,18 @@ def shipped_config(overrides: dict | None = None) -> dict:
         ["git", "show", "HEAD:config.default.json"], cwd=ROOT,
         capture_output=True,
     )
-    if head.returncode != 0:
-        detail = head.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"cannot read committed config.default.json: {detail or head.returncode}"
-        )
-    cfg = json.loads(head.stdout.decode("utf-8"))
+    if head.returncode == 0:
+        cfg = json.loads(head.stdout.decode("utf-8"))
+    else:
+        # A copy unpacked from the release has no git: its own defaults file is
+        # the shipped one. The user's config.json is still never read.
+        shipped = ROOT / "config.default.json"
+        if not shipped.exists():
+            detail = head.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"cannot read committed config.default.json: {detail or head.returncode}"
+            )
+        cfg = json.loads(shipped.read_text(encoding="utf-8"))
     if overrides:
         cfg.update(overrides)
     return cfg
@@ -510,10 +516,20 @@ def running_instances():
     fight over the screen capture - so a check that launches one has to know
     the field is clear, otherwise it measures the wrong process.
     """
-    out = subprocess.run(["tasklist"], capture_output=True).stdout
-    text = out.decode("cp1251", errors="replace")
-    return [l.split()[0] for l in text.splitlines()
-            if "pythonw.exe" in l or "nvngx.dll" in l]
+    # By command line: any other Python program on the machine (a voice
+    # server, a speech model) is a pythonw.exe too, and is not in the way.
+    script = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'nvngx.dll' -or "
+              "($_.Name -eq 'pythonw.exe' -and $_.CommandLine -match 'neuralscreen') } | "
+              "ForEach-Object { $_.Name }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = subprocess.run(["tasklist"], capture_output=True).stdout
+        text = out.decode("cp1251", errors="replace")
+        return [l.split()[0] for l in text.splitlines()
+                if "pythonw.exe" in l or "nvngx.dll" in l]
+    return [l.strip() for l in out.decode("utf-8", errors="replace").splitlines() if l.strip()]
 
 
 def launch(overrides: dict | None = None):
@@ -537,8 +553,15 @@ def launch(overrides: dict | None = None):
     with path.open("w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
     _test_config_path = path
+    # A folder with no runtime of its own: the launcher would fall back to a
+    # pythonw on PATH, which has none of the app's packages. Hand it the one
+    # running this test, as "Start NeuralScreen.vbs" does.
+    env = None
+    own = Path(sys.executable).with_name("pythonw.exe")
+    if not (ROOT / "runtime" / "pythonw.exe").exists() and own.exists():
+        env = dict(os.environ, NEURALSCREEN_PYTHON=str(own))
     subprocess.run(["cscript", "//nologo", "NeuralScreen.vbs", "--config", str(path)],
-                   cwd=ROOT, capture_output=True)
+                   cwd=ROOT, capture_output=True, env=env)
     return offset
 
 
@@ -561,10 +584,8 @@ def quit_app(timeout=8.0):
     deadline = time.monotonic() + timeout
     left = []
     while time.monotonic() < deadline:
-        out = subprocess.run(["tasklist"], capture_output=True).stdout
-        text = out.decode("cp1251", errors="replace")
-        left = [l for l in text.splitlines()
-                if "pythonw.exe" in l or "nvngx.dll" in l]
+        # Ours only: other Python programs on the machine are not left behind.
+        left = running_instances()
         if not left:
             try:
                 if _test_config_path and _test_config_path.is_file():

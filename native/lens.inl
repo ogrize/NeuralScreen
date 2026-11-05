@@ -28,9 +28,11 @@
 // (#159: noise over an unbent picture), and with none of them on and the
 // fisheye off the pass does not run at all.
 //
-// Where it runs: after the network, after the HDR composite and after Frame
-// Generation - never on the network's input, the motion field or what DLSS-G
-// interpolates (its motion is rectilinear). Each export site hands its source
+// Where it runs: on an NR frame, on the network's input (EvaluateVideo), so the
+// network, the composite and Frame Generation all work on the camera's picture.
+// The motion field stays rectilinear, so a strong fisheye can cost some accuracy
+// at the edges. With NR off, and on an HDR composite (which reads the native
+// capture), it runs at the end instead: each export site hands its source
 // to LensApply, which writes the lens into a texture of its own and returns
 // that in the source's state - or the source itself while the lens is off, so
 // the ordinary path is the code it always was. The source is never written:
@@ -46,8 +48,9 @@ cbuffer LensCB : register(b0)
     float gNoise;     // webcam noise, 0..1
     uint  gSeed;      // the noise's frame: 30 a second, from the clock
     uint  gFlags;     // bit0 bend (the fisheye), bit1 a linear (scRGB) target,
-                      // bit2 a PQ (HDR10) target,
-                      // bits 8-15 the softness towards the corners, 255ths
+                      // bit2 a PQ (HDR10) target, bit3 one field's lines black, bit4 which,
+                      // bits 8-15 the softness towards the corners, 255ths,
+                      // bits 16-31 the wipe: left of this x the picture as it came
     float gVignette;  // 0..1
     float gAberration;// 0..1
     float gSensor;    // a small sensor's look, 0..1
@@ -186,6 +189,23 @@ float3 Colour(float3 e)
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= gSize.x || id.y >= gSize.y) return;
+    // The before/after wipe, where the network's own cannot show this pass.
+    const uint wipe = gFlags >> 16;
+    if (id.x < wipe)
+    {
+        gDst[id.xy] = float4(gSrc.Load(int3(id.xy, 0)).rgb, 1.0);
+        return;
+    }
+    if (wipe != 0u && id.x < wipe + 2u)
+    {
+        gDst[id.xy] = float4(217.0 / 255.0, 119.0 / 255.0, 87.0 / 255.0, 1.0);
+        return;
+    }
+    if ((gFlags & 8u) != 0u && (id.y & 1u) == ((gFlags >> 4) & 1u))
+    {
+        gDst[id.xy] = float4(0, 0, 0, 1);
+        return;
+    }
     float2 size = float2(gSize);
     float2 centre = size * 0.5;
     float2 d = float2(id.xy) + 0.5 - centre;
@@ -283,6 +303,15 @@ static float g_lens_exposure = 0.0f;     // #164, stops, -1..1
 static float g_lens_contrast = 0.0f;     // #164, -1..1
 static float g_lens_warmth = 0.0f;       // #164, -1..1
 static float g_lens_tint = 0.0f;         // #164, -1..1
+static bool  g_lens_interlace = false;   // the switch: NR weaves two passes (EvaluateVideo)
+static bool  g_lens_interlace_blend = false;  // and softens the rows between the passes
+static uint32_t g_lens_interlace_mode = 0;   // 0 two passes a frame, 1 half-rate, 2 alternating
+static bool  g_interlace_clean = false;  // a third pass over the woven picture
+static bool  g_interlace_valid = false;  // the results a half-rate or alternating frame reuses exist
+static bool  g_lens_black_lines = false; // one field's lines black, in the first thing that reads the picture
+static UINT  g_lens_field = 0;           // which field: flipped once per frame
+static bool  g_lens_on_input = false;    // this frame: already on the network's input
+static uint32_t g_lens_wipe_flags = 0;   // this frame: the wipe to draw here, as a frame's flags
 
 static constexpr float kLensFovMin = 30.0f;
 static constexpr float kLensFovMax = 170.0f;
@@ -292,7 +321,7 @@ static constexpr float kLensFovMax = 170.0f;
 // pixel readback, and a scratch for Frame Generation's frames, which is
 // copied back at once. A target outlives its list: the shown one is read by
 // the back-buffer copy after the producer's list has run.
-enum LensSlot { LENS_SHOWN, LENS_EXPORT, LENS_RECORD, LENS_PIXELS, LENS_FG, LENS_SLOTS };
+enum LensSlot { LENS_SHOWN, LENS_EXPORT, LENS_RECORD, LENS_PIXELS, LENS_FG, LENS_INPUT, LENS_SLOTS };
 
 static struct LensState {
     winrt::com_ptr<ID3D12RootSignature> root;
@@ -317,7 +346,8 @@ static bool LensColour()
            g_lens_warmth != 0.0f || g_lens_tint != 0.0f;
 }
 
-static bool LensActive()
+// The camera and the colour, which go on the network's input on an NR frame.
+static bool LensEffects()
 {
     // The camera needs its switch; the colour (#164) does not - it is the
     // picture's grading, set with the camera off as well.
@@ -325,6 +355,13 @@ static bool LensActive()
         (g_lens_bend || g_lens_noise > 0.0f || g_lens_vignette > 0.0f ||
          g_lens_aberration > 0.0f || g_lens_sensor > 0.0f || g_lens_soft > 0.0f);
     return (camera || LensColour()) && !g_lens.failed && !g_submission_failed;
+}
+
+// The black lines run in the same pass, so they too are on the network's input on an
+// NR frame: to it they are picture, and it works on them.
+static bool LensActive()
+{
+    return LensEffects() || (g_lens_black_lines && !g_lens.failed && !g_submission_failed);
 }
 
 static bool LensPipeline()
@@ -421,6 +458,8 @@ static ID3D12Resource *LensApply(ID3D12GraphicsCommandList *list, ID3D12Resource
                                  D3D12_RESOURCE_STATES state, LensSlot slot)
 {
     if (!LensActive() || src == nullptr || list == nullptr) return src;
+    // Once a frame: on the input on an NR frame, else on each thing that goes out.
+    if (g_lens_on_input && slot != LENS_INPUT) return src;
     if (!LensPipeline()) return src;
     auto &s = g_lens;
     const auto desc = src->GetDesc();
@@ -461,7 +500,9 @@ static ID3D12Resource *LensApply(ID3D12GraphicsCommandList *list, ID3D12Resource
         {w, hgt}, f_rect, half_diag / corner, cam * std::clamp(g_lens_noise, 0.0f, 1.0f),
         static_cast<UINT>(GetTickCount64() / 33u),
         (g_lens_on && g_lens_bend ? 1u : 0u) | (linear ? 2u : 0u) | (pq ? 4u : 0u) |
-            (static_cast<UINT>(cam * std::clamp(g_lens_soft, 0.0f, 1.0f) * 255.0f + 0.5f) << 8),
+            (g_lens_black_lines ? 8u : 0u) | ((g_lens_field & 1u) << 4) |
+            (static_cast<UINT>(cam * std::clamp(g_lens_soft, 0.0f, 1.0f) * 255.0f + 0.5f) << 8) |
+            ((g_lens_wipe_flags != 0 ? (std::min)(SplitXFromFlags(g_lens_wipe_flags, w), 0xFFFFu) : 0u) << 16),
         cam * std::clamp(g_lens_vignette, 0.0f, 1.0f), cam * std::clamp(g_lens_aberration, 0.0f, 1.0f),
         cam * std::clamp(g_lens_sensor, 0.0f, 1.0f), std::clamp(g_lens_saturation, -1.0f, 1.0f),
         std::clamp(g_lens_exposure, -1.0f, 1.0f), std::clamp(g_lens_contrast, -1.0f, 1.0f),
@@ -527,6 +568,7 @@ static ID3D12Resource *LensApply(ID3D12GraphicsCommandList *list, ID3D12Resource
 static void LensInPlace(ID3D12GraphicsCommandList *list, ID3D12Resource *image)
 {
     if (!LensActive() || image == nullptr) return;
+    g_lens_field ^= 1u;   // each of FG's frames is a frame on screen
     ID3D12Resource *lens = LensApply(list, image, D3D12_RESOURCE_STATE_COPY_SOURCE, LENS_FG);
     if (lens == image) return;
     D3D12_RESOURCE_BARRIER to = Transition(image, D3D12_RESOURCE_STATE_COPY_SOURCE,

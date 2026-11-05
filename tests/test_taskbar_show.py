@@ -87,6 +87,16 @@ class _Display:
     def draw_overlay(self, interval: float) -> None:
         self.draws.append(interval)
 
+    # The panel shows the pointer on open and gives it back on close.
+    def force_pointer_visible(self):
+        return True
+
+    def restore_pointer(self):
+        pass
+
+    def forget_pointer(self):
+        pass
+
 
 def _state(visible: bool, *, window_visible: bool = True):
     # st.hotkeys is part of the state the real startup always builds
@@ -107,7 +117,7 @@ def _state(visible: bool, *, window_visible: bool = True):
         tray_commands=queue.Queue(),
         display=_Display(visible, window_visible),
         hotkeys=_Hotkeys(),
-        window_hwnd=None, running=True, frame_index=0,
+        window_hwnd=None, running=True, frame_index=0, cfg={},
     )
 
 

@@ -174,7 +174,9 @@ package** on the Program tab (or the path in the failure dialog), then check
 drawn over it — a Windows rule. Switch the game to *borderless*.
 
 **The menu pointer is missing or frozen.** A fullscreen game hides the system
-cursor, and the overlay only shows that one. Borderless fixes it.
+cursor, and the overlay only shows that one. **Show the mouse when the panel
+opens** brings it back by taking the focus from the game while the panel is
+open. If it stays hidden, borderless fixes it.
 
 **Everything is too bright and the sliders do nothing.** HDR is on for that
 display. Turn it off (Win+Alt+B), or try **HDR compatibility** in the

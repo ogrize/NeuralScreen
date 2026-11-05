@@ -159,7 +159,9 @@ def main() -> int:
             "the composites cache their descriptors on, and an even pass "
             "count then rewrites a shader-visible heap every frame while "
             "earlier frames are still reading it")
-    if "((passes & 1u) != 0u) ? v.nr_out : v.nr_alt" not in cpp:
+    # Interlace's weave lands its pass in nr_out too: the same parity, one more case.
+    if ("((passes & 1u) != 0u) ? v.nr_out : v.nr_alt" not in cpp
+            and "((passes & 1u) != 0u || weave) ? v.nr_out : v.nr_alt" not in cpp):
         failures.append(
             "the cascade no longer picks its first buffer by parity - the "
             "last pass has to land in v.nr_out without anything moving")

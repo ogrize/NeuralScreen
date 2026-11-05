@@ -78,7 +78,8 @@ def run(code, *, hardware: bool, bypass: bool, fg: bool = False,
     send = Mock()
     namespace = dict(st=st, bypass=bypass, motion_status=status, time=time, sys=sys,
                      check_worker=Mock(), prepare_capture=capture, send_frame=send,
-                     _perf=Mock(), EARLY_REPLY=True, WORKER_SCENE=worker_scene)
+                     _perf=Mock(), EARLY_REPLY=True, WORKER_SCENE=worker_scene,
+                     fg_match=Mock())
     exec(code, namespace)
     assert send.call_count == 1, 'one frame, one send'
     # The loop asks for the answer as soon as the frame is queued; the

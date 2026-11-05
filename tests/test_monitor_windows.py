@@ -102,8 +102,11 @@ def main() -> int:
                                 origin=repr(ORIGIN)),
                     encoding="utf-8")
     offset = autocheck.log_offset()
-    proc = subprocess.Popen([str(BASE / "runtime" / "pythonw.exe"), str(shim)],
-                            cwd=str(BASE))
+    # A folder with no runtime of its own borrows the Python running this test.
+    pythonw = BASE / "runtime" / "pythonw.exe"
+    if not pythonw.exists():
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+    proc = subprocess.Popen([str(pythonw), str(shim)], cwd=str(BASE))
     try:
         if autocheck.wait_for(offset, autocheck.NR_FRAME_MARKER, 60.0) is None:
             print("FAIL: the pipeline never came up")

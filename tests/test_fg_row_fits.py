@@ -63,6 +63,7 @@ def main() -> int:
                     fonts.load(size, mono=mono, lang=_l))
             menu.visible = True
             menu.page = "main"
+            menu.folds = {"fg"}
             menu.set_state({"lang": lang, "nr": True, "gpu_ok": True,
                             "frame_generation": False, "frame_multiplier": 2})
             menu.draw(pygame.Surface((1920, 1080)))
@@ -96,6 +97,7 @@ def main() -> int:
             1.0, lambda size, mono=False, bold=False: fonts.load(size, mono=mono))
         menu.visible = True
         menu.page = "main"
+        menu.folds = {"fg"}
         menu.set_state({"nr": True, "gpu_ok": True, "frame_generation": False,
                         "frame_multiplier": 2})
         surface = pygame.Surface((1920, 1080))

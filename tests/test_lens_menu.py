@@ -58,6 +58,11 @@ def _item(menu, key):
     return next((it for it in menu.items if it.key == key), None)
 
 
+def _colour_fold(menu):
+    # The Colour tile has the same key.
+    return next((it for it in menu.items if it.kind == "fold" and it.key == "colour"), None)
+
+
 def _check_menu(failures: list) -> None:
     from i18n import STRINGS
     # v2.6.0: the camera is a tile; what it does lives in its fold-out, on
@@ -245,10 +250,10 @@ def _check_colour(failures: list) -> None:
     menu = _menu("en", folds=("camera",), **colour)
     if any(_item(menu, key) is not None for key in COLOUR):
         failures.append("a colour slider is in the camera block")
-    head = _item(menu, "colour")
+    head = _colour_fold(menu)
     if head is None or head.kind != "fold" or head.extra.get("summary") != "Changed: 4":
         failures.append(f"the colour block header is {head and head.extra}")
-    if _item(_menu("en", folds=()), "colour").extra.get("summary") != "As it is":
+    if _colour_fold(_menu("en", folds=())).extra.get("summary") != "As it is":
         failures.append("an untouched colour block does not say it is as it is")
     menu = _menu("en", folds=("colour",), **colour)
     for key, text in (("lens_saturation", "-20%"), ("lens_exposure", "+0.50 EV"),
@@ -294,7 +299,7 @@ def _check_colour(failures: list) -> None:
                       ({"lens_tint": "x"}, False), ({"lens_exposure": 0.001}, False)):
         if commands.lens_wanted(cfg) is not told:
             failures.append(f"a new worker with {cfg} is told LENS: {not told}")
-    want = (-0.4, 1.0, 0.25, -0.5, 0.75, 0.0)
+    want = (-0.4, 1.0, 0.25, -0.5, 0.75, 1024.0)  # Match game frames is on
     if last is None or tuple(round(v, 2) for v in last[5:]) != want:
         failures.append(f"the LENS command carries {last and last[5:]}, not {want}")
 

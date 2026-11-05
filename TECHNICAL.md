@@ -318,6 +318,7 @@ a maintainer's GPU, paths or experimental switches cannot leak into a release.
 | `capture_in_worker` | worker captures the desktop itself (DDA, `false` — dxcam in Python) |
 | `pixels_in_shm` | result pixels come back through a shared section instead of the pipe (`false` — pipe, as before) |
 | `flow_preset` | which DIS configuration estimates the motion field: `fast` (default, as shipped), `ultrafast`, `medium`. See "What the guides cost" |
+| `fg_match_screen` | on by default: FG runs the lowest step whose real x step fills the screen's refresh, with `frame_multiplier` as the most it uses; the source is not capped |
 | `frame_limit_mode`, `frame_limit_custom` | active-pipeline cap: 30, 60, custom 15–240, or unlimited |
 | `frame_generation`, `frame_multiplier` | opt-in FG and the requested multiplier, ×2 to ×6; a refused step is walked down, a refused ×2 turns it back off |
 | `nr_preset` | the NR model preset, `default` / `a` / `b` (`default`): the feature's `Hint.Render.Preset` (0 / 1 / 2, `NS_NR_PRESET`), read once per worker, so a change restarts it. The runtime 310.9.16 has preset B (new, smaller, up to 2x faster by NVIDIA's figures; its default) and A (the previous model); the bundled 310.8.0 has one model and ignores the hint. The worker logs `[pure] NR runtime <version> (<bytes>), preset hint <n>` once per load |
@@ -333,9 +334,12 @@ a maintainer's GPU, paths or experimental switches cannot leak into a release.
 | `open_menu_on_start` | open the menu on launch; `false` — a short alert instead |
 | `hotkeys` | `{"toggle": "Num1", ...}` — see README, "Using it". Names: `Num0`-`Num9`, `Numdot`, `Numplus`, `Numminus`, `Nummul`, `Numdiv`, `F1`-`F12`, `Insert`, `Home`, letters, digits, with `Ctrl+`/`Alt+`/`Shift+` |
 | `nr_passes` | 1-4, how many passes the network makes over one frame (Boost only). An experiment; the second pass costs about a third of the frame rate and every extra pass carries its own network - about 640 MB at a 2560x1440 work size, and it scales with that size |
-| `fps_overlay` | `off` / `tl` / `tr` / `bl` / `br` - the on-screen frame counter and the corner it sits in |
+| `fps_overlay` | `off` / `tl` / `tr` / `bl` / `br` - the on-screen frame counter and the corner it sits in; it also carries latency and GPU usage (whole GPU, from NVML, `app/gpu_usage.py`) |
 | `notifications` | `all` / `errors` / `none` - which pop-ups show; `errors` keeps those whose text matches an error string (`ALERT_ERROR_KEYS` in `app/display.py`, in every language), and a hidden one still goes to the log. Default `all` |
 | `process_priority` | `normal` / `above_normal` / `high` - the Windows priority class of the program and of its worker (Task Manager's "Set priority"), re-applied to a restarted worker; the read-back is logged. Realtime is not offered. Default `normal` |
+| `game_gpu_low` | off by default: while NR is on, the full-screen game in focus (or the captured window) runs at the idle GPU scheduling class, and goes back with NR off or on exit; no elevation needed |
+| `nr_hold_repeats` | on by default: while the game moves, a frame it has not changed gets no NR and the last result stays; NR settles once the picture has stopped for 150 ms |
+| `lens_nr_only`, `colour_nr_only` | off by default: the camera or the colour goes off whenever NR is off and returns with it, keeping its sliders |
 | `lens`, `lens_bend`, `lens_fov`, `lens_noise`, `lens_vignette`, `lens_aberration`, `lens_sensor`, `lens_soft`, `lens_saturation`, `lens_exposure`, `lens_contrast`, `lens_warmth`, `lens_tint` | the camera: off by default; the fisheye within it (on); the game's horizontal field of view, 60-170 degrees (110); webcam noise (0.3), vignette, chromatic aberration, the small sensor's tone and the softness towards the corners (0) - each 0-1 in 0.05 steps, 0 = off. The softness was part of the small sensor until #168. The colour (#164) - saturation, exposure, contrast, warmth (blue-red), tint (green-magenta) - is -1..1, 0 = the picture as it is; exposure is in stops, the balance keeps the luminance. It has its own block and runs with the camera off |
 | `tray_on_minimise`, `tray_on_close` | what the taskbar button's minimise and close do; both off by default, and neither stops the neural pass |
 | `menu_scale_auto` | the panel size is still the automatic fit; cleared for good the moment a scale step is chosen by hand |
@@ -469,7 +473,34 @@ the worker stays warm but capture, motion, Evaluate and Present counters stop.
 Opening the menu needs only the transparent HUD layer. Turning NR back on — or
 starting FG/recording/a screenshot — rearms channels from a fresh source frame
 and cleared temporal history. Those explicit consumers use bypass frames while
-NR itself remains off.
+NR itself remains off. The camera is one of them too, and so is the colour while
+its switch is on and a slider is off zero.
+
+**Enlarge window to screen** (window mode) is the one way here to give a game more
+frames: in a smaller window it really renders fewer pixels. The overlay stays the size
+of the monitor and shows the window enlarged, by DLSS (`PresentWindowUpscale`). The
+overlay is click-through, so `app/window_scale.py` keeps the window placed so that the
+pixel the picture shows at the cursor lies under it, except while the game hides or
+confines the cursor. The overlay hides while anything else has the focus. Measured with
+a stand-in load (`tests/experiment_window_upscale.py`): 2560x1440 16.5-18.8 fps,
+1280x720 enlarged about 32 fps. Uncapped, the game takes the whole GPU and the picture
+updates about 12 times a second, so a game's frame cap is part of using it.
+
+**Interlace the screen** is a field of the LENS command and asks for two passes.
+With NR off it changes nothing. With NR on the worker weaves them: both run side by side on the same
+input, pass 1 lands on the even lines of the output and pass 2 on the odd, with
+no black lines. A second pass runs with the whole profile unless it has a
+per-pass set, and the edit stabilizer is off while weaving. **NR runs** sets how often: **Every frame** is the above; **Half-rate** (Boost only)
+runs one pass on every other frame and lays its last change over each new frame;
+**Alternating** gives the two passes turns, each result kept against the input it was
+made from. Both tell the network its motion field covers two frames. **Third pass** (not at Half-rate) runs the network again on every frame, over the whole
+woven picture, with its result laid over that picture. **Show black lines** blacks out
+every other line, the other lines on the next frame, in the camera's pass: ahead of the
+network on an NR frame, so it works on them. With NR off it keeps frames coming. **Blend the rows** (on
+by default) has each line keep 65% of its own pass and take 35% of the other,
+which leaves 30% of what tells the rows apart. Without Boost both
+passes run at full size, with a full-size buffer of its own for the second; this
+is the one case where more than one pass runs without Boost.
 
 **A lost capture.** In an RDP session, and while a UAC prompt or the lock
 screen holds the secure desktop, Desktop Duplication (or a window capture) goes
@@ -632,6 +663,12 @@ RTSS per process): the game 159.1 -> 54.9 fps (1% low 60.2 -> 18.8), NR 1.5 ->
 54.6 fps. The class does not make the card faster, it moves the split to about
 half each - which a frame cap in the game also does, without elevation. So it
 stays an environment variable, not a setting.
+
+Lowering the game instead needs no elevation, and that is the setting,
+`game_gpu_low` (`app/game_gpu.py`). Measured on one game, in focus and uncapped,
+RTX 4070, HAGS on, 12 s per step: the game at normal 10.8 frames a second and
+98 ms, below normal 12.2 and 93 ms, idle 37.9 and 30 ms, normal again 10.1 and
+120 ms. The game's own frame rate was not measured.
 
 ### work_scale costs nothing (in upscale mode)
 
@@ -913,6 +950,15 @@ model it was saved with.
 
 
 ## Camera
+
+On an NR frame the whole pass runs **before the network**, on its input, and
+works without NR on the raw capture. An HDR composite reads the native capture,
+so there it stays at the end. The motion field still describes the unbent
+picture, so a strong fisheye can cost NR and Frame Generation accuracy near the
+edges. The text below describes the pass, and the end-of-frame path it keeps
+for NR off and HDR. The before/after wipe compares against the raw capture there
+too: with NR off the pass leaves everything left of the wipe as it came, so the
+camera and the colour can be compared on their own.
 
 **Camera** (main page, under the effect sliders) lays a camera's look over the
 picture the viewer sees, in one pass (`native/lens.inl`), with every part on

@@ -52,7 +52,8 @@ STATE = {
 #: Every control the main page had before v2.6.0, by (kind, key) - the tiles
 #: replace the four switches.
 OLD_PAGE = (
-    [("tile", k) for k in ("nr", "frame_generation", "boost", "lens")]
+    [("tile", k) for k in ("nr", "boost", "interlace", "frame_generation", "lens", "colour",
+                                 "theme", "fps_overlay")]
     + [("button", f"frame_multiplier:{m}") for m in range(2, 7)]
     + [("choice", "profile"), ("slider", "intensity"), ("choice", "frame_limit_mode"),
        ("slider", "nr_res"), ("segmented", "nr_passes"), ("segmented", "style"),

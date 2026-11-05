@@ -853,10 +853,19 @@ def send_lens(worker: subprocess.Popen, enabled: bool, fov: float,
               vignette: float = 0.0, aberration: float = 0.0,
               sensor: float = 0.0, soft: float = 0.0, saturation: float = 0.0,
               exposure: float = 0.0, contrast: float = 0.0, warmth: float = 0.0,
-              tint: float = 0.0) -> None:
+              tint: float = 0.0, interlace: bool = False,
+              interlace_blend: bool = False, interlace_black: bool = False,
+              interlace_mode: int = 0, interlace_clean: bool = False,
+              hold_repeats: bool = False) -> None:
     """LENS: the camera on or off - the fisheye from a horizontal field of
     view (bend), webcam noise, a vignette, chromatic aberration, a small
-    sensor's tone and softness towards the corners, each 0..1.
+    sensor's tone and softness towards the corners, each 0..1. `interlace`
+    has NR weave two passes line by line, camera on or off, and
+    `interlace_blend` softens the rows between them, and `interlace_black` blacks
+    out every other line, the other ones each frame, ahead of NR when NR is on.
+    `interlace_mode` is 0 two passes a frame, 1 half-rate NR, 2 alternating passes.
+    `interlace_clean` runs a third pass over the woven picture.
+    `hold_repeats` runs no NR on a frame the game has not changed while it moves.
 
     Nothing is recreated and nothing is waited for: the worker applies it to
     the next frame and answers LNAK, which the reader drops like any answer
@@ -870,7 +879,13 @@ def send_lens(worker: subprocess.Popen, enabled: bool, fov: float,
         return 0.0 if v != v else min(1.0, max(-1.0, v))
     worker.stdin.write(struct.pack(LENS_FMT, LENS_MAGIC, flags, fov, noise, int(pts),
                                    signed(saturation), signed(exposure), signed(contrast),
-                                   signed(warmth), signed(tint), 0.0))
+                                   signed(warmth), signed(tint),
+                                   float((1 if interlace else 0)
+                                         | (2 if interlace and interlace_blend else 0)
+                                         | (64 if interlace and interlace_black else 0)
+                                         | ((int(interlace_mode) & 3) << 7)
+                                         | (512 if interlace and interlace_clean else 0)
+                                         | (1024 if hold_repeats else 0))))
     worker.stdin.flush()
 
 

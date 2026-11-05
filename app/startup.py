@@ -48,6 +48,7 @@ from paths import BASE_DIR
 from pipeline import require_compatibility, start_worker
 from protocol import SharedFrameBuffer, WorkerReader
 from recorder import VideoRecorder
+import window_scale
 from settings_io import (APP_VERSION, THEME_NAMES, _work_size, cascade_passes,
                          clean_per_pass, hotkey_labels,
                          load_config, load_presets, resolve_params,
@@ -640,6 +641,7 @@ def configure(st) -> None:
     # the residual composite puts the detail back off the native frame.
     st.nr_small = bool(st.cfg.get("nr_small", True))
     os.environ["NS_NR_SMALL"] = "1" if st.nr_small else "0"
+    window_scale.apply_env(st.cfg)
     # Which composite Boost uses: the matched residual (the network's delta
     # laid over the native frame, so text and edges keep full resolution) or
     # direct reconstruction (the network's own output, stretched). Residual

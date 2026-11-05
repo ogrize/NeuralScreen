@@ -192,6 +192,7 @@ def main() -> int:
             ours, theirs, other = 0x7701, 0x1_8000_1234, 0x5505
             disp.get_hwnd = lambda: ours
             st.last_foreground = theirs
+            commands.foreign_foreground = lambda: 0   # the open sees no window of another program
             _toggle_menu(st)                     # open
             fake = _FakeUser32(foreground=ours)
             winapi._user32 = fake

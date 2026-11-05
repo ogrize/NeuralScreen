@@ -2164,7 +2164,10 @@ struct VideoLensCmd
     int64_t pts;
     float saturation, exposure;   // #164: -1..1 each, 0 = as it is
     float contrast, warmth, tint; // #164: levels and white balance, -1..1 each
-    float reserved;
+    float extras;                 // a whole number: bit 0 NR weaves two passes line by
+                                  // line, bit 1 and blends the rows,
+                                  // bit 6 black lines, alternating each frame,
+                                  // bits 7-8 the interlace mode, bit 9 the clean-up pass
 };
 using VideoLensAck = VideoPerPassAck;   // magic LNAK, ok, two reserved, pts
 // UIRC: where the picture holds a still interface (app/ui_protect.py), in
@@ -2378,6 +2381,17 @@ struct VideoState
     // state. Allocated with the pair rather than when a second pass is asked
     // for, because allocating mid-frame is how a switch becomes a stutter.
     ID3D12Resource *nr_alt = nullptr;
+    // Interlaced NR without Boost: where the passes write, as there is no scratch
+    // buffer to borrow.
+    ID3D12Resource *weave_first = nullptr;
+    ID3D12Resource *weave_out = nullptr;
+    // Alternating under Boost: the input the second pass's result was made from.
+    ID3D12Resource *nr_in2 = nullptr;
+    // The clean-up pass: the woven picture before it, and under Boost what the
+    // network is handed of it and what it makes.
+    ID3D12Resource *weave_mid = nullptr;
+    ID3D12Resource *nr_in3 = nullptr;
+    ID3D12Resource *nr_out3 = nullptr;
 };
 
 // Two different questions, and conflating them is what turned a 10-bit
@@ -2423,6 +2437,73 @@ static bool g_fg_reset = true;
 // always new and has no source clock.
 static bool g_fg_source_fresh = true;
 static double g_fg_source_seconds = 0.0;
+
+// How long a new picture took: from the moment the source put it up (the
+// capture's own QPC stamp) to our Present of it. The compositor and the screen
+// come after this, and the game's own input lag before it. Once a second the
+// log says the mean and the rate of new pictures, which the client's frame count
+// cannot give: it holds repeats too. The client reads the line for the badge.
+// The gaps say how even the pictures were: as the source made them, and as we
+// showed them. A source that is even and a shown gap that is not is our doing.
+static void NoteLatency(double source_seconds)
+{
+    if (source_seconds <= 0.0) return;
+    LARGE_INTEGER now = {}, freq = {};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    if (freq.QuadPart <= 0) return;
+    const double seconds = static_cast<double>(now.QuadPart) / freq.QuadPart;
+    const double ms = (seconds - source_seconds) * 1000.0;
+    if (ms < 0.0 || ms > 2000.0) return;
+    static std::mutex guard;
+    static double sum = 0.0, most = 0.0, since = 0.0;
+    static unsigned count = 0;
+    struct Gaps
+    {
+        double last = 0.0, sum = 0.0, squares = 0.0, most = 0.0;
+        unsigned n = 0;
+        void Add(double at)
+        {
+            const double gap = (at - last) * 1000.0;
+            // Past a quarter of a second it is a pause, not a rhythm.
+            if (last > 0.0 && gap > 0.0 && gap < 250.0)
+            {
+                sum += gap; squares += gap * gap; ++n;
+                if (gap > most) most = gap;
+            }
+            last = at;
+        }
+        double Mean() const { return n ? sum / n : 0.0; }
+        double Spread() const
+        {
+            if (n == 0) return 0.0;
+            const double mean = sum / n, variance = squares / n - mean * mean;
+            return variance > 0.0 ? std::sqrt(variance) : 0.0;
+        }
+        void Clear() { sum = squares = most = 0.0; n = 0; }
+    };
+    static Gaps shown, made;
+    std::lock_guard<std::mutex> lock(guard);
+    if (since <= 0.0) since = seconds;
+    sum += ms;
+    if (ms > most) most = ms;
+    ++count;
+    shown.Add(seconds);
+    made.Add(source_seconds);
+    if (seconds - since >= 1.0)
+    {
+        Log("[lat] %.1f ms mean, %.1f ms max | %.1f new pictures a second | "
+            "source gap %.1f +-%.1f max %.1f ms | shown gap %.1f +-%.1f max %.1f ms",
+            sum / count, most, count / (seconds - since),
+            made.Mean(), made.Spread(), made.most,
+            shown.Mean(), shown.Spread(), shown.most);
+        sum = most = 0.0;
+        count = 0;
+        since = seconds;
+        shown.Clear();
+        made.Clear();
+    }
+}
 static bool EnsurePresentFormat(bool hdr, bool pq = false);
 static void CloseHdrResources();
 
@@ -2620,6 +2701,43 @@ static bool                       g_present_space_set = false;
 static HANDLE                     g_present_thread;
 static DWORD                      g_present_tid;
 static UINT                       g_present_w, g_present_h;
+// NS_WINDOW_UPSCALE=monitor or WxH: a captured window smaller than the overlay is
+// enlarged to it, by DLSS or (NS_WINDOW_UPSCALE_FILTER=bilinear) a plain filter, so a
+// game running in a small window really renders fewer pixels. The window stays where
+// it is under the overlay; app/window_scale.py keeps the mouse on it.
+static UINT                       g_win_up_w, g_win_up_h;
+static bool                       g_win_up_bilinear;
+static bool PresentWindowUpscale(VideoState &v, bool bypass);
+static void ReadWindowUpscale()
+{
+    static bool read = false;
+    if (read) return;
+    read = true;
+    char buf[32] = {};
+    if (GetEnvironmentVariableA("NS_WINDOW_UPSCALE", buf, sizeof(buf)) == 0) return;
+    if (_stricmp(buf, "monitor") == 0)
+    {
+        // The monitor the overlay is placed on.
+        POINT at = {0, 0};
+        char pos[32] = {};
+        if (GetEnvironmentVariableA("NS_WINDOW_POS", pos, sizeof(pos)) > 0)
+            sscanf_s(pos, "%ld,%ld", &at.x, &at.y);
+        MONITORINFO mi = {sizeof(mi)};
+        if (GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTOPRIMARY), &mi))
+        {
+            g_win_up_w = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
+            g_win_up_h = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+        }
+    }
+    else if (sscanf_s(buf, "%ux%u", &g_win_up_w, &g_win_up_h) != 2)
+        g_win_up_w = g_win_up_h = 0;
+    if (g_win_up_w == 0 || g_win_up_h == 0) { g_win_up_w = g_win_up_h = 0; return; }
+    char filter[16] = {};
+    g_win_up_bilinear = GetEnvironmentVariableA("NS_WINDOW_UPSCALE_FILTER", filter, sizeof(filter)) > 0 &&
+                        _stricmp(filter, "bilinear") == 0;
+    Log("[dlss] test: windows enlarged to %ux%u by %s", g_win_up_w, g_win_up_h,
+        g_win_up_bilinear ? "a bilinear filter" : "DLSS");
+}
 static bool                       g_present_capturable;  // debug flag from WNDO
 // The flags the present window was opened with, and whether the swap chain
 // has to be built again before the next frame. See PresentStatus.
@@ -2785,6 +2903,8 @@ static void ClosePresent()
 
 static bool OpenPresent(UINT width, UINT height, uint32_t flags)
 {
+    ReadWindowUpscale();
+    if (g_win_up_w != 0) { width = g_win_up_w; height = g_win_up_h; }
     ClosePresent();
     if (width < 64 || height < 64 || width > 7680 || height > 4320)
     {
@@ -2896,6 +3016,7 @@ static bool ShowPresentBelowPanel();   // defined next to RevealOnFirstPresent
 static bool PresentModeActive(const VideoState &v)
 {
     if (g_present_swap == nullptr) return false;
+    if (g_win_up_w != 0 && g_wgc_active) return true;
     // One line per mismatch episode rather than one per process (F9): a
     // session that resizes twice has two episodes, and the second one is
     // otherwise silent in the log exactly when someone is reading it.
@@ -2956,6 +3077,28 @@ static bool PresentModeActive(const VideoState &v)
 static void FollowCapturedWindow()
 {
     if (!g_wgc_active || g_present_hwnd == nullptr || g_wgc_hwnd == nullptr) return;
+    if (g_win_up_w != 0)
+    {
+        // The overlay stays the size of the screen, and covers it only while the
+        // game or our own panel has the focus: anything else has to be reachable.
+        static const DWORD client_pid = [] {
+            char buf[16] = {};
+            return GetEnvironmentVariableA("NS_CLIENT_PID", buf, sizeof(buf)) > 0
+                ? static_cast<DWORD>(strtoul(buf, nullptr, 10)) : 0ul;
+        }();
+        const HWND fg = GetForegroundWindow();
+        DWORD fg_pid = 0, target_pid = 0;
+        if (fg != nullptr) GetWindowThreadProcessId(fg, &fg_pid);
+        GetWindowThreadProcessId(g_wgc_hwnd, &target_pid);
+        const bool wanted = IsWindow(g_wgc_hwnd) && !IsIconic(g_wgc_hwnd) &&
+                            (client_pid == 0 || fg == nullptr || fg_pid == target_pid || fg_pid == client_pid);
+        if (wanted != g_present_shown)
+        {
+            ShowWindow(g_present_hwnd, wanted ? SW_SHOWNOACTIVATE : SW_HIDE);
+            g_present_shown = wanted;
+        }
+        return;
+    }
     if (!IsWindow(g_wgc_hwnd)) return;      // the client notices and switches back
     if (IsIconic(g_wgc_hwnd))
     {
@@ -3509,6 +3652,7 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
 {
     if (!RebuildPresentIfStale()) return false;
     if (submitted) *submitted = 0;
+    if (g_win_up_w != 0 && g_wgc_active) return PresentWindowUpscale(v, false);
     if (g_hdr_capture) return PresentHdr(v, false, true, submitted);
     // Only when HDR compatibility is on. With it off there is nothing to put
     // back: the swap chain was created R8G8B8A8 and no HDR frame has ever
@@ -3594,6 +3738,7 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
 static bool PresentBypass(VideoState &v)
 {
     if (!RebuildPresentIfStale()) return false;
+    if (g_win_up_w != 0 && g_wgc_active) return PresentWindowUpscale(v, true);
     // NR OFF is not a reason to tear the presenter down. Frame Generation owns
     // the present loop on this path too; it only goes away when it is not
     // asked for (or the switch is off). This used to call
@@ -4057,6 +4202,37 @@ static const char kResidualHlsl[] =
     "    gDst[id.xy] = float4(result, 1.0);\n"
     "}\n";
 
+// Interlaced NR: the output from both passes' results. The even lines take mostly
+// the first and the odd mostly the second, by gBlend: 0 keeps them apart, 0.5 would
+// be one picture. It is the residual composite's arithmetic on that mix, each result
+// against the input it was made from; a negative strength means direct reconstruction
+// (the network's own output).
+static const char kWeaveHlsl[] =
+    "Texture2D<float4>   gNative : register(t0);\n"
+    "Texture2D<float4>   gNrIn   : register(t1);\n"
+    "Texture2D<float4>   gFirst  : register(t2);\n"
+    "Texture2D<float4>   gSecond : register(t3);\n"
+    "Texture2D<float4>   gNrIn2  : register(t4);\n"
+    "RWTexture2D<float4> gDst    : register(u0);\n"
+    "cbuffer RC : register(b0) { uint gW; uint gH; float gStrength; float gBlend; };\n"
+    "SamplerState gSamp : register(s0);\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void CSMain(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    if (id.x >= gW || id.y >= gH) return;\n"
+    "    float2 uv = (float2(id.xy) + 0.5f) / float2(gW, gH);\n"
+    "    float k = (id.y & 1u) != 0u ? 1.0f - gBlend : gBlend;\n"
+    "    float3 nrOut = lerp(gFirst.SampleLevel(gSamp, uv, 0).rgb,\n"
+    "                        gSecond.SampleLevel(gSamp, uv, 0).rgb, k);\n"
+    "    float3 result = nrOut;\n"
+    "    if (gStrength >= 0.0f)\n"
+    "    {\n"
+    "        float3 nrIn = lerp(gNrIn.SampleLevel(gSamp, uv, 0).rgb, gNrIn2.SampleLevel(gSamp, uv, 0).rgb, k);\n"
+    "        result = max(gNative[id.xy].rgb + (nrOut - nrIn) * gStrength, 0.0);\n"
+    "    }\n"
+    "    gDst[id.xy] = float4(result, 1.0);\n"
+    "}\n";
+
 typedef HRESULT(WINAPI *PFN_D3DCompile_)(LPCVOID, SIZE_T, LPCSTR, const void *, void *,
                                          LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
 typedef HRESULT(WINAPI *PFN_D3D12SerializeRootSignature_)(const D3D12_ROOT_SIGNATURE_DESC *,
@@ -4084,6 +4260,13 @@ static ID3D12Resource       *g_res_native_bound;
 static ID3D12Resource       *g_res_in_bound;
 static ID3D12Resource       *g_res_out_bound;
 static ID3D12Resource       *g_res_dst_bound;
+// The weave of interlaced NR, made on first use. A failure leaves NR unwoven.
+static ID3D12RootSignature  *g_weave_rs;
+static ID3D12PipelineState  *g_weave_pso;
+static ID3D12DescriptorHeap *g_weave_heap;
+static constexpr UINT        kWeaveSets = 32;     // two dispatches a frame at most
+static UINT                  g_weave_ring;
+static bool                  g_weave_failed;
 static VideoTex              g_motion_small;      // motion field at flow resolution
 static UINT                  g_motion_w, g_motion_h;  // 0 = motion arrives at work resolution
 
@@ -4458,6 +4641,145 @@ static void ResidualCompose(ID3D12Resource *native, ID3D12Resource *nr_in,
     memcpy(&rc[2], &str, sizeof(float));
     h.list->SetComputeRoot32BitConstants(0, 3, rc, 0);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_residual_heap->GetGPUDescriptorHandleForHeapStart();
+    h.list->SetComputeRootDescriptorTable(1, gpu);
+    h.list->Dispatch((w + 7) / 8, (h_ + 7) / 8, 1);
+}
+
+static bool EnsureWeavePipeline()
+{
+    if (g_weave_pso != nullptr) return true;
+    if (g_weave_failed) return false;
+    g_weave_failed = true;   // until everything below has worked
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 5}};
+    D3D12_ROOT_PARAMETER roots[2] = {};
+    roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    roots[0].Constants = {0, 0, 4};
+    roots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    roots[1].DescriptorTable = {2, ranges};
+    D3D12_STATIC_SAMPLER_DESC samp = {};
+    samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samp.MaxLOD = D3D12_FLOAT32_MAX;
+    samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd = {2, roots, 1, &samp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    winrt::com_ptr<ID3DBlob> rs_code, code, errors;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, rs_code.put(), errors.put())) ||
+        FAILED(h.dev->CreateRootSignature(0, rs_code->GetBufferPointer(), rs_code->GetBufferSize(),
+                                          IID_PPV_ARGS(&g_weave_rs))))
+    {
+        Log("[weave] root signature failed - NR runs unwoven");
+        return false;
+    }
+    errors = nullptr;
+    if (FAILED(D3DCompile(kWeaveHlsl, sizeof(kWeaveHlsl) - 1, "weave.hlsl", nullptr, nullptr,
+                          "CSMain", "cs_5_0", 0, 0, code.put(), errors.put())))
+    {
+        Log("[weave] shader failed: %s - NR runs unwoven",
+            errors ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = g_weave_rs;
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 6 * kWeaveSets;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(h.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_weave_pso))) ||
+        FAILED(h.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_weave_heap))))
+    {
+        if (g_weave_pso != nullptr) { g_weave_pso->Release(); g_weave_pso = nullptr; }
+        Log("[weave] pipeline failed - NR runs unwoven");
+        return false;
+    }
+    g_weave_failed = false;
+    return true;
+}
+
+// Whether this view's NR frames are woven from two passes: the switch, and
+// the second feature to do it with. Boost has its scratch buffer already;
+// without it EnsureWeaveOutput makes one.
+static bool InterlaceWeaves(const VideoState &v)
+{
+    return g_lens_interlace && g_lens_interlace_mode != 1u && !g_weave_failed &&
+           (!v.nr_small || v.nr_alt != nullptr) &&
+           v.passes_live >= 2u && g_nr_pass[1] != nullptr;
+}
+
+// How many features this view can use out of `want`. Without Boost a cascade
+// has nothing to run through, but the weave needs only the two.
+static unsigned ExecutablePasses(const VideoState &v, unsigned want)
+{
+    if (v.nr_small && v.nr_alt != nullptr) return want;
+    if (!g_lens_interlace || g_lens_interlace_mode == 1u || g_weave_failed || want < 2u) return 1u;
+    return (g_interlace_clean && want >= 3u) ? 3u : 2u;
+}
+
+// Without Boost: full-size results for the two passes, resting in UNORDERED_ACCESS
+// like v.output and the scratch buffers. The weave writes v.output from them.
+static bool EnsureWeaveOutput(VideoState &v, UINT w, UINT hgt)
+{
+    D3D12_HEAP_PROPERTIES def = {};
+    def.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = v.output->GetDesc();
+    td.Width = w; td.Height = hgt;
+    for (ID3D12Resource **t : {&v.weave_first, &v.weave_out})
+    {
+        if (*t != nullptr) continue;
+        if (FAILED(h.dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(t))))
+        {
+            *t = nullptr;
+            g_weave_failed = true;
+            Log("[weave] %ux%u target failed - NR runs unwoven", w, hgt);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Write dst from both passes' results. first and second must be in
+// NON_PIXEL_SHADER_RESOURCE and dst in UNORDERED_ACCESS. Descriptors as in
+// BindResidualDescriptors.
+static void WeavePasses(ID3D12Resource *native, ID3D12Resource *nr_in, ID3D12Resource *nr_in2,
+                        ID3D12Resource *first, ID3D12Resource *second, UINT w, UINT h_,
+                        ID3D12Resource *dst, float strength)
+{
+    // A set per dispatch, round a ring: the clean-up pass weaves twice in one list.
+    const UINT stride = h.dev->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT set = g_weave_ring++ % kWeaveSets;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_weave_heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(set) * 6u * stride;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    for (ID3D12Resource *srv : {native, nr_in, first, second, nr_in2})
+    {
+        h.dev->CreateShaderResourceView(srv, &sd, cpu);
+        cpu.ptr += stride;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    h.dev->CreateUnorderedAccessView(dst, nullptr, &ud, cpu);
+    ID3D12DescriptorHeap *heaps[] = { g_weave_heap };
+    h.list->SetDescriptorHeaps(1, heaps);
+    h.list->SetComputeRootSignature(g_weave_rs);
+    h.list->SetPipelineState(g_weave_pso);
+    // Each line keeps 65% of its own pass and takes 35% of the other: what tells
+    // the rows apart drops to 30%, and they are still the two passes.
+    const float blend = g_lens_interlace_blend ? 0.35f : 0.0f;
+    UINT32 rc[4] = { w, h_, 0, 0 };
+    memcpy(&rc[2], &strength, sizeof(float));
+    memcpy(&rc[3], &blend, sizeof(float));
+    h.list->SetComputeRoot32BitConstants(0, 4, rc, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_weave_heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(set) * 6u * stride;
     h.list->SetComputeRootDescriptorTable(1, gpu);
     h.list->Dispatch((w + 7) / 8, (h_ + 7) / 8, 1);
 }
@@ -6470,6 +6792,7 @@ static void ProfileGpuEnd(ProfileStage, unsigned query_count)
 
 #include "nvofa.inl"
 #include "stabilizer.inl"
+#include "dlss.inl"
 #include "cursor.inl"
 
 static void ReadProfileGpuTime(int slot)
@@ -6626,6 +6949,9 @@ static void ApplyNrEvalParams(NVSDK_NGX_Parameter *p, ID3D12Resource *color,
 // `seh` receives the exception code if the runtime faults; the caller decides
 // what to do about it, because only the caller knows whether the command list
 // can still be abandoned cleanly.
+static float g_nr_mv_times = 1.0f;
+static unsigned long long g_nr_pass_runs = 0;
+static unsigned g_interlace_tick = 0;
 static NVSDK_NGX_Result EvalNrPass(VideoState &v, NVSDK_NGX_Handle *feature,
                                    ID3D12Resource *nr_color,
                                    ID3D12Resource *nr_result,
@@ -6662,8 +6988,9 @@ static NVSDK_NGX_Result EvalNrPass(VideoState &v, NVSDK_NGX_Handle *feature,
     h.params->Set("DLSSNR.MVecSubrectWidth", v.w); h.params->Set("DLSSNR.MVecSubrectHeight", v.hgt);
     h.params->Set("DLSSNR.OutputSubrectBaseX", 0u); h.params->Set("DLSSNR.OutputSubrectBaseY", 0u);
     h.params->Set("DLSSNR.OutputSubrectWidth", nw); h.params->Set("DLSSNR.OutputSubrectHeight", nh);
-    h.params->Set("DLSSNR.MVecScaleX", v.nr_small ? float(nw)/v.w : 1.0f);
-    h.params->Set("DLSSNR.MVecScaleY", v.nr_small ? float(nh)/v.hgt : 1.0f);
+    // A pass that sees every other frame: the field is one frame's motion.
+    h.params->Set("DLSSNR.MVecScaleX", (v.nr_small ? float(nw)/v.w : 1.0f) * g_nr_mv_times);
+    h.params->Set("DLSSNR.MVecScaleY", (v.nr_small ? float(nh)/v.hgt : 1.0f) * g_nr_mv_times);
     bool verified = true;
     verified &= SetVerifiedU(h.params, "DLSSNR.Enabled", 1u);
     verified &= SetVerifiedU(h.params, "DLSSNR.Reset", (unsigned int)reset);
@@ -6706,13 +7033,98 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
     // resolution, and colour has to be scaled down into nr_in first.
     const UINT nw = v.nr_small ? v.nr_w : cw;
     const UINT nh = v.nr_small ? v.nr_h : ch;
-    if (v.nr_small)
+    // The camera goes on the network's input, and everything below reads this
+    // instead of the capture. The composites cache their descriptors on the
+    // pointer, so a switch waits for the frames still reading the old set.
+    ID3D12Resource *color = g_lens_on_input
+        ? LensApply(h.list, v.color.tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, LENS_INPUT)
+        : v.color.tex;
+    {
+        static ID3D12Resource *last_color = nullptr;
+        if (color != last_color)
+        {
+            if (h.fence && h.fence_value != 0 &&
+                !WaitFenceValue(h.fence, h.fence_value, 30000, "lens-input"))
+            {
+                AbortCommands();
+                return false;
+            }
+            last_color = color;
+        }
+    }
+    // Interlaced NR: two passes side by side rather than one after the other,
+    // both on the whole frame, each with its own history and result buffer.
+    // Pass 1 ends up on the even lines of the output and pass 2 on the odd.
+    // Handing each pass only its own lines was tried: no faster (30.25 ms against
+    // 29.90 at 1408x792 under Boost) and about 1 code of 255 on a real desktop.
+    const bool weave = InterlaceWeaves(v) && EnsureWeavePipeline() &&
+                       (v.nr_small || EnsureWeaveOutput(v, cw, ch));
+    // Half-rate (Boost only: it needs a composite to lay the last change over the new
+    // frame): the network runs on every other frame, and the frames between keep its
+    // result and the input it was made from. Alternating: the passes take turns, so
+    // a line is one frame behind at most. A reset runs everything, for a fresh start.
+    const unsigned tick = g_interlace_tick++ & 1u;
+    const bool fresh = reset != 0 || !g_interlace_valid;
+    const bool half = g_lens_interlace && g_lens_interlace_mode == 1u && v.nr_small;
+    const bool skip_nr = half && !fresh && tick != 0u;
+    bool alternate = weave && g_lens_interlace_mode == 2u;
+    if (alternate && v.nr_small && v.nr_in2 == nullptr)
+    {
+        if (DlssPipeline())
+            v.nr_in2 = DlssTex(nw, nh, DXGI_FORMAT_R8G8B8A8_UNORM, true,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (v.nr_in2 == nullptr)
+        {
+            Log("[weave] no second input - the passes both run on every frame");
+            alternate = false;
+        }
+    }
+    g_nr_mv_times = ((half || alternate) && !fresh) ? 2.0f : 1.0f;
+    // The clean-up pass: a third network over the woven picture, on every frame. Its
+    // result is laid over that picture as a pass's is over the capture.
+    bool clean = weave && g_interlace_clean && v.passes_live >= 3u && g_nr_pass[2] != nullptr;
+    if (clean)
+    {
+        const DXGI_FORMAT rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (v.weave_mid == nullptr)
+            v.weave_mid = DlssTex(cw, ch, rgba, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (v.nr_small && DlssPipeline())
+        {
+            if (v.nr_in3 == nullptr)
+                v.nr_in3 = DlssTex(nw, nh, rgba, true, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (v.nr_out3 == nullptr)
+                v.nr_out3 = DlssTex(nw, nh, rgba, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        if (v.weave_mid == nullptr || (v.nr_small && (v.nr_in3 == nullptr || v.nr_out3 == nullptr)))
+        {
+            Log("[weave] no room for the clean-up pass - the picture goes out as woven");
+            clean = false;
+        }
+    }
+    {
+        static bool said_clean = false;
+        if (clean != said_clean)
+        {
+            said_clean = clean;
+            Log("[video] the clean-up pass %s", clean ? "runs over the woven picture" : "is off");
+        }
+    }
+    ID3D12Resource *woven = clean ? v.weave_mid : v.output;
+    if (alternate && v.nr_small)
+    {
+        // Each pass's input stays as it was made: the composite needs it. Through
+        // the DLSS scaler, whose descriptors go round a ring: the composite's pair
+        // is cached on one pointer, and two would rewrite it under a running frame.
+        if (fresh || tick == 0u) DlssScale(color, v.nr_in, nw, nh);
+        if (fresh || tick == 1u) DlssScale(color, v.nr_in2, nw, nh);
+    }
+    else if (v.nr_small && !skip_nr)
     {
         D3D12_RESOURCE_BARRIER to_uav = Transition(
             v.nr_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         h.list->ResourceBarrier(1, &to_uav);
-        ScaleColorInto(v.color.tex, cw, ch, v.nr_in, nw, nh, 0);
+        ScaleColorInto(color, cw, ch, v.nr_in, nw, nh, 0);
         D3D12_RESOURCE_BARRIER to_srv = Transition(
             v.nr_in, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -6729,7 +7141,7 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
     // The timestamps around this loop now measure ALL the passes together.
     // That is deliberate: "eval on GPU" should mean what the network cost
     // this frame, and with a cascade that is the whole cascade.
-    unsigned passes = (v.nr_small && v.nr_alt != nullptr) ? v.passes_live : 1u;
+    unsigned passes = ExecutablePasses(v, v.passes_live);
     if (passes < 1u) passes = 1u;
     if (passes > NR_MAX_PASSES) passes = NR_MAX_PASSES;
     // The count is settled BEFORE the first pass writes anything, because the
@@ -6752,7 +7164,19 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
         }
         passes = have;
     }
-    ID3D12Resource *src = v.nr_small ? v.nr_in : v.color.tex;
+    if (weave) passes = 2u;
+    else if (!v.nr_small || g_lens_interlace_mode == 1u && g_lens_interlace) passes = 1u;
+    if (skip_nr) passes = 0u;
+    {
+        static bool said = false;
+        if (weave != said)
+        {
+            said = weave;
+            Log("[video] interlaced NR %s", weave
+                ? "on: pass 1 draws the even lines, pass 2 the odd" : "off");
+        }
+    }
+    ID3D12Resource *src = v.nr_small ? v.nr_in : color;
     // Where pass 0 writes. The LAST pass has to land in v.nr_out: that is the
     // name the residual composite, the scale-up and the present all use. So
     // the ping-pong starts on whichever of the two scratch buffers makes the
@@ -6770,14 +7194,22 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
     // that showed up as a blank frame the last time it was hit. Parity is
     // free and leaves every pointer where it was.
     ID3D12Resource *dst = v.nr_small
-        ? (((passes & 1u) != 0u) ? v.nr_out : v.nr_alt)
-        : v.output;
+        ? (((passes & 1u) != 0u || weave) ? v.nr_out : v.nr_alt)
+        : (weave ? v.weave_first : v.output);
     DWORD code = 0;
     NVSDK_NGX_Result result = static_cast<NVSDK_NGX_Result>(0x7FFFFFFF);
     for (unsigned pass = 0; pass < passes; ++pass)
     {
         NVSDK_NGX_Handle *feature = (pass == 0) ? h.feature : g_nr_pass[pass];
-        if (pass > 0)
+        if (weave)
+        {
+            if (alternate && !fresh && pass != tick) continue;
+            dst = pass == 0u ? (v.nr_small ? v.nr_out : v.weave_first)
+                             : (v.nr_small ? v.nr_alt : v.weave_out);
+            if (alternate && v.nr_small) src = pass == 0u ? v.nr_in : v.nr_in2;
+        }
+        ++g_nr_pass_runs;
+        if (pass > 0 && !weave)
         {
             // The previous pass's output is this pass's input: NGX reads the
             // colour as a shader resource. It goes back to UAV immediately
@@ -6788,9 +7220,13 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             h.list->ResourceBarrier(1, &to_srv);
         }
-        result = EvalNrPass(v, feature, src, dst, nw, nh, reset, &code, pass);
+        // Woven, the second pass is no later stage of the picture: without a
+        // set of its own it takes the profile whole, its local tone too, or
+        // every other line would come out a different brightness.
+        result = EvalNrPass(v, feature, src, dst, nw, nh, reset, &code,
+                            (weave && !g_per_pass_set) ? 0u : pass);
         g_last_eval_result = static_cast<uint32_t>(result);
-        if (pass > 0)
+        if (pass > 0 && !weave)
         {
             D3D12_RESOURCE_BARRIER back = Transition(
                 src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -6807,7 +7243,7 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
             return false;
         }
         if (NVSDK_NGX_FAILED(result)) break;   // reported below, as before
-        if (pass + 1u < passes)
+        if (!weave && pass + 1u < passes)
         {
             ID3D12Resource *next_src = dst;
             dst = (dst == v.nr_out) ? v.nr_alt : v.nr_out;
@@ -6815,6 +7251,23 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
         }
     }
     if (ts) h.list->EndQuery(g_ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, h.frame_slot * 4 + 3);
+    if (weave && !v.nr_small)
+    {
+        // Both results are full-size already: the network's own output.
+        D3D12_RESOURCE_BARRIER to_srv[] = {
+            Transition(v.weave_first, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(v.weave_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+        h.list->ResourceBarrier(2, to_srv);
+        WeavePasses(color, color, color, v.weave_first, v.weave_out, cw, ch, woven, -1.0f);
+        D3D12_RESOURCE_BARRIER back[] = {
+            Transition(v.weave_first, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            Transition(v.weave_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+        h.list->ResourceBarrier(2, back);
+    }
     if (v.nr_small)
     {
         // The result is work-sized; stretch it into the full-res output the
@@ -6830,23 +7283,76 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
         // NS_STAB: the edit is steadied over time first (stabilizer.inl) and
         // the composite reads the steadied result instead of nr_out.
         ID3D12Resource *edit = v.nr_out;
-        if (StabRequested() && StabilizeEdit(v, nw, nh, reset != 0))
+        // Not woven: only one of the two results would be steadied, and the
+        // lines would differ in the very thing it steadies.
+        if (weave || half) StabForget();
+        else if (StabRequested() && StabilizeEdit(v, nw, nh, reset != 0))
             edit = g_stab.out;
-        if (v.residual)
-            ResidualCompose(v.color.tex, v.nr_in, edit, cw, ch, v.output,
+        if (weave) {}   // WeavePasses writes the whole output
+        else if (v.residual)
+            ResidualCompose(color, v.nr_in, edit, cw, ch, v.output,
                             v.residual_strength);
         else
             ScaleColorInto(edit, nw, nh, v.output, cw, ch, 1);
         if (edit != v.nr_out) StabAfterCompose();
+        if (weave)
+        {
+            D3D12_RESOURCE_BARRIER alt_srv = Transition(
+                v.nr_alt, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            h.list->ResourceBarrier(1, &alt_srv);
+            WeavePasses(color, v.nr_in, alternate ? v.nr_in2 : v.nr_in, v.nr_out, v.nr_alt, cw, ch, woven,
+                            v.residual ? v.residual_strength : -1.0f);
+            D3D12_RESOURCE_BARRIER alt_uav = Transition(
+                v.nr_alt, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            h.list->ResourceBarrier(1, &alt_uav);
+        }
         D3D12_RESOURCE_BARRIER back = Transition(
             v.nr_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         h.list->ResourceBarrier(1, &back);
     }
+    if (clean && !NVSDK_NGX_FAILED(result))
+    {
+        // Every frame, on one frame's motion, whatever the two passes before it did.
+        g_nr_mv_times = 1.0f;
+        auto mid_srv = Transition(v.weave_mid, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        h.list->ResourceBarrier(1, &mid_srv);
+        if (v.nr_small) DlssScale(v.weave_mid, v.nr_in3, nw, nh);
+        ++g_nr_pass_runs;
+        result = EvalNrPass(v, g_nr_pass[2], v.nr_small ? v.nr_in3 : v.weave_mid,
+                            v.nr_small ? v.nr_out3 : v.output, nw, nh, reset, &code, 2u);
+        g_last_eval_result = static_cast<uint32_t>(result);
+        if (code != 0)
+        {
+            AbortCommands();
+            StabFailed();
+            ReportFailure(failure_stage, "seh", static_cast<HRESULT>(code));
+            Log("[pure] direct evaluate exception 0x%08X (the clean-up pass)", code);
+            return false;
+        }
+        if (v.nr_small)
+        {
+            auto out_srv = Transition(v.nr_out3, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            h.list->ResourceBarrier(1, &out_srv);
+            WeavePasses(v.weave_mid, v.nr_in3, v.nr_in3, v.nr_out3, v.nr_out3, cw, ch, v.output,
+                        v.residual ? v.residual_strength : -1.0f);
+            auto out_uav = Transition(v.nr_out3, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            h.list->ResourceBarrier(1, &out_uav);
+        }
+        auto mid_uav = Transition(v.weave_mid, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        h.list->ResourceBarrier(1, &mid_uav);
+    }
     if (ts) ProfileGpuEnd(PS_EVAL, 4);
     const UINT64 fence = EndCommands();
     if (submitted) *submitted = fence;
     if (fence == 0) { StabFailed(); return false; }
+    g_interlace_valid = true;
     if (NVSDK_NGX_FAILED(result))
     {
         ReportFailure(failure_stage, "ngx-result", static_cast<HRESULT>(result));
@@ -7248,6 +7754,7 @@ static int ReadVideoMessage(VideoState &v, VideoFrameHeader &fh, std::vector<BYT
 
 static void ReleaseVideoTextures(VideoState &v)
 {
+    CloseDlss();
     CloseNvofa();
     CloseStab();
     CloseLens();
@@ -7276,6 +7783,7 @@ static void ReleaseVideoTextures(VideoState &v)
     // dispatch against freed GPU memory (audit C++ H1).
     g_res_native_bound = g_res_in_bound = nullptr;
     g_res_out_bound = g_res_dst_bound = nullptr;
+    g_interlace_valid = false;
     // And the split-view wipe: its UAV is cached by v.output's address, so a
     // new output landing at the freed one would have the wipe's clear write
     // through a descriptor of the released texture.
@@ -7283,6 +7791,11 @@ static void ReleaseVideoTextures(VideoState &v)
     if (v.nr_in != nullptr) { v.nr_in->Release(); v.nr_in = nullptr; }
     if (v.nr_out != nullptr) { v.nr_out->Release(); v.nr_out = nullptr; }
     if (v.nr_alt != nullptr) { v.nr_alt->Release(); v.nr_alt = nullptr; }
+    if (v.nr_in2 != nullptr) { v.nr_in2->Release(); v.nr_in2 = nullptr; }
+    for (ID3D12Resource **t : {&v.weave_mid, &v.nr_in3, &v.nr_out3})
+        if (*t != nullptr) { (*t)->Release(); *t = nullptr; }
+    if (v.weave_first != nullptr) { v.weave_first->Release(); v.weave_first = nullptr; }
+    if (v.weave_out != nullptr) { v.weave_out->Release(); v.weave_out = nullptr; }
     v.nr_small = false;
     v.inputs_ready = false;
     v.color_in_srv = false;
@@ -7324,6 +7837,9 @@ static unsigned g_ph_evaluated;
 // (parameters, passes, resize, ...), a frame flag change (the wipe, a
 // screenshot), a reset or new content brings the evaluation back.
 static constexpr unsigned kStillEvaluations = 4;
+// A game at 10 fps is still moving; a longer gap than that means it has stopped.
+static constexpr unsigned kRepeatHoldMs = 150;
+static bool g_hold_repeats = true;
 static unsigned g_still_evals = 0;
 static uint32_t g_still_flags = 0;
 static unsigned g_ph_fresh_evaluated;
@@ -7601,7 +8117,8 @@ static int RunVideo()
             if (live)
             {
                 FlushProfileFrames();
-                Log("[live] input stream closed after %u frames; %u direct evaluations", frame, g_eval_count);
+                Log("[live] input stream closed after %u frames; %u direct evaluations; %llu NR passes",
+                    frame, g_eval_count, g_nr_pass_runs);
                 // Explicit NGX resource cleanup BEFORE exiting: without
                 // ReleaseFeature/Shutdown1 the GPU resources (the D3D12 device,
                 // NGX) are freed only when the process dies, and a quick
@@ -7685,7 +8202,7 @@ static int RunVideo()
                 // can execute. Surplus features retire instead of occupying VRAM.
                 v.nr_small_asked = asked_small;   // Boost may flip here at 1:1
                 const unsigned want = NrPassesFromFlags(rc.flags);
-                const unsigned effective = (v.nr_small && v.nr_alt != nullptr) ? want : 1u;
+                const unsigned effective = ExecutablePasses(v, want);
                 // Said on EVERY parameter apply, not only when it changes:
                 // the first attempt at this went quiet, and a quiet cascade
                 // is indistinguishable from one that was never asked for.
@@ -7784,7 +8301,7 @@ static int RunVideo()
                     rc.width, rc.height);
             }
             v.passes = NrPassesFromFlags(rc.flags);
-            const unsigned effective = (v.nr_small && v.nr_alt != nullptr) ? v.passes : 1u;
+            const unsigned effective = ExecutablePasses(v, v.passes);
             v.passes_live = (h.feature != nullptr)
                 ? EnsurePassFeatures(rc.width, rc.height, flags,
                                      (v.nr_small || !rup) ? 0 : rc.full_w,
@@ -7928,6 +8445,7 @@ static int RunVideo()
             // is not a number keeps the last good one.
             const bool on = (g_lens_cmd.flags & 1u) != 0;
             const bool bend = (g_lens_cmd.flags & 2u) != 0;
+            g_still_evals = 0;   // a held result was made with the old settings
             const float vignette = static_cast<float>((g_lens_cmd.flags >> 8) & 0xFFu) / 255.0f;
             const float aberration = static_cast<float>((g_lens_cmd.flags >> 16) & 0xFFu) / 255.0f;
             const float sensor = static_cast<float>((g_lens_cmd.flags >> 24) & 0xFFu) / 255.0f;
@@ -7961,6 +8479,25 @@ static int RunVideo()
             g_lens_contrast = con;
             g_lens_warmth = warm;
             g_lens_tint = tint;
+            const uint32_t extras = (std::isfinite(g_lens_cmd.extras) && g_lens_cmd.extras >= 0.0f)
+                ? static_cast<uint32_t>(g_lens_cmd.extras + 0.5f) : 0u;
+            g_lens_black_lines = (extras & 64u) != 0;
+            if (((extras >> 7) & 3u) != g_lens_interlace_mode)
+            {
+                g_interlace_valid = false;
+                Log("[lens] interlace mode %u", (extras >> 7) & 3u);
+            }
+            g_lens_interlace_mode = (extras >> 7) & 3u;
+            g_interlace_clean = (extras & 512u) != 0;
+            g_hold_repeats = (extras & 1024u) != 0;
+            const bool interlace = (extras & 1u) != 0;
+            if (interlace != g_lens_interlace)
+            {
+                g_lens.said = false;
+                Log("[lens] interlace %s", interlace ? "on" : "off");
+            }
+            g_lens_interlace = interlace;
+            g_lens_interlace_blend = (extras & 2u) != 0;
             // Logged when it switches, not on every angle: a dragged slider
             // sends one command per degree.
             if (on != g_lens_on)
@@ -8318,7 +8855,7 @@ static int RunVideo()
             // PresentFrame. It was left out by the merge that brought the two
             // paths together, not for a reason - and lost ~20% of the frame
             // rate to three fence waits and a lockstep round trip.
-            defer_tail = warmup_done && h.feature != nullptr &&
+            defer_tail = g_win_up_w == 0 && warmup_done && h.feature != nullptr &&
                 PresentModeActive(v) &&
                 (fh.reserved & (FRAME_FLAG_BYPASS | FRAME_FLAG_SPLIT | FRAME_FLAG_WANT_PIXELS)) == 0;
             // This frame is being processed: remember what it will show, so a
@@ -8397,9 +8934,36 @@ static int RunVideo()
         }
         const bool still_frame = !source_fresh && !g_fg_reset && fh.reset == 0 &&
                                  fh.reserved == g_still_flags;
-        g_still_evals = still_frame ? g_still_evals + 1 : 0;
+        // While the game is moving a repeat is only the loop running ahead of
+        // it. NR run on it again moves the picture a little (see
+        // kStillEvaluations), between two frames the game made: the last result
+        // stays. Only once the picture has really stopped does NR settle on it.
+        static std::chrono::steady_clock::time_point last_new_picture;
+        const auto picture_now = std::chrono::steady_clock::now();
+        if (source_fresh) last_new_picture = picture_now;
+        const bool repeat_in_motion = g_hold_repeats && still_frame &&
+            picture_now - last_new_picture < std::chrono::milliseconds(kRepeatHoldMs);
+        g_still_evals = still_frame ? g_still_evals + (repeat_in_motion ? 0u : 1u) : 0;
         g_still_flags = fh.reserved;
-        const bool keep_result = !bypass && still_frame && g_still_evals > kStillEvaluations;
+        // The camera on the input can change with no change in the capture:
+        // its noise moves on, so nothing is held while it runs.
+        g_lens_on_input = !bypass && !g_hdr_capture;
+        g_lens_field ^= 1u;   // the black lines take the other lines this frame
+        // SplitCompose draws the wipe on an SDR NR frame, over all the effects.
+        // Anywhere else the camera runs at the end, and the wipe goes with it.
+        g_lens_wipe_flags = (!g_lens_on_input && (fh.reserved & FRAME_FLAG_SPLIT) != 0) ? fh.reserved : 0u;
+        {
+            static bool said_input = false;
+            const bool now = g_lens_on_input && LensActive();
+            if (now != said_input)
+            {
+                said_input = now;
+                Log("[lens] %s", now ? "the camera runs before NR" : "the camera does not run before NR");
+            }
+        }
+        const bool keep_result = !bypass && still_frame &&
+                                 (repeat_in_motion || g_still_evals > kStillEvaluations) &&
+                                 !(g_lens_on_input && LensActive());
         if (bypass) StabForget();   // the input moves on while NR is off
         if (!bypass && !keep_result)
         {
@@ -8442,6 +9006,8 @@ static int RunVideo()
                 g_early_reply.pts = fh.pts;
             }
             const bool pres_ok = bypass ? PresentBypass(v) : PresentFrame(v, defer_tail ? &present_done : nullptr);
+            // Frame Generation shows the real frame later: its presenter says when.
+            if (pres_ok && source_fresh && !FgRequested()) NoteLatency(g_fg_source_seconds);
             // Whether PresentFrame answered already (FRAME_FLAG_EARLY_REPLY):
             // Frame Generation presents elsewhere and never does.
             const bool replied = g_early_reply.sent;

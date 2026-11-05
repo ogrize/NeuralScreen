@@ -14,7 +14,7 @@ Checked without a GPU:
 3. the limits hold: at most 32 rectangles, at most 20% of the picture;
 4. the command layer sends the rectangles only when they change, an empty
    list once when FG or the setting goes off, and nothing to a fresh worker
-   that has nothing to protect; the menu has the switch in the Network block.
+   that has nothing to protect; the menu has the switch in the FG block.
 
 Fails before the change: there was no detector, no UIRC and no switch.
 #177: the real gray section is flat - read as it was, the detector raised as
@@ -200,11 +200,11 @@ def main() -> int:
     menu = ui.OverlayMenu(1.0, lambda size, mono=False, bold=False: fonts.load(size, mono=mono))
     menu.visible = True
     menu.set_state({"nr": True, "gpu_ok": True, "profile": "Natural", "profiles": ["Natural"]})
-    menu.folds = {"net"}
+    menu.folds = {"fg"}
     menu.layout(1920, 1080)
     sw = next((i for i in menu.items if i.kind == "toggle" and i.key == "fg_ui_protect"), None)
     if sw is None or menu._activate_item(sw) != [("toggle", "fg_ui_protect")]:
-        failures.append("the Network block has no interface-protection switch")
+        failures.append("the FG block has no interface-protection switch")
     pygame.quit()
 
     for f in failures:

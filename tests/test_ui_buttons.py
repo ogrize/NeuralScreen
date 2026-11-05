@@ -69,18 +69,11 @@ def paint(menu):
     menu.draw(surf)
 
 
-def click(menu, item):
-    """Click the CONTROL's own zone, not the row (user rule 16.09).
-
-    A toggle/slider/choice row spans the panel width and only the control
-    inside it reacts - the switch pill, the slider track, the select
-    field, the hotkey field. item.extra["hit"] is that zone; the tests
-    click it so they exercise the same target a user does.
-    """
+def reveal(menu, item):
+    """Scroll to the item first, as a user would: with every block open the
+    page is taller than the screen. The same item after the relayout."""
     view = getattr(menu, "_viewport", None)
     if menu._max_scroll > 0 and view is not None and not view.contains(item.rect):
-        # Scrolled to it first, as a user would: with every block open the
-        # page is taller than the screen. The same item after the relayout.
         top, bottom = view.top + 6, view.bottom - 6
         shift = (item.rect.top - top if item.rect.top < top
                  else item.rect.bottom - bottom)
@@ -89,6 +82,18 @@ def click(menu, item):
         paint(menu)
         item = next(i for i in menu.items if i.kind == item.kind and i.key == item.key
                     and i.extra.get("label") == item.extra.get("label"))
+    return item
+
+
+def click(menu, item):
+    """Click the CONTROL's own zone, not the row (user rule 16.09).
+
+    A toggle/slider/choice row spans the panel width and only the control
+    inside it reacts - the switch pill, the slider track, the select
+    field, the hotkey field. item.extra["hit"] is that zone; the tests
+    click it so they exercise the same target a user does.
+    """
+    item = reveal(menu, item)
     zone = item.extra.get("hit") or item.rect
     if item.extra.get("hit", True) is None:
         raise AssertionError(
@@ -375,6 +380,7 @@ def main() -> int:
     if row is None:
         failures.append("no captured-window row in window mode")
     else:
+        row = reveal(menu, row)
         out = menu.handle_event(pygame.event.Event(
             pygame.MOUSEBUTTONDOWN, {"pos": row.rect.center, "button": 1}))
         if menu.page != "windows" or out != [("capture", None)]:
@@ -389,6 +395,7 @@ def main() -> int:
     #     left cell returns to the whole screen (nothing to do when it is
     #     already there), the right cell opens the window list.
     seg = find(menu, "segmented", "source")
+    seg = reveal(menu, seg) if seg else seg
     if seg is None:
         failures.append("no source segment on the main page")
     else:
@@ -416,6 +423,7 @@ def main() -> int:
         menu.layout(3840, 2160)
         paint(menu)
         seg = find(menu, "segmented", "source")
+        seg = reveal(menu, seg) if seg else seg
         cells = (seg.extra.get("cells") or []) if seg else []
         if cells:
             out = menu.handle_event(pygame.event.Event(
@@ -484,6 +492,7 @@ def main() -> int:
         if sl is None:
             failures.append(f"no {key} slider on the main page")
             continue
+        sl = reveal(menu, sl)
         track = sl.extra.get("track")
         if track is None:
             failures.append(f"the {key} slider has no track")

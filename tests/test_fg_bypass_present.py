@@ -159,7 +159,7 @@ def main() -> int:
     defer = later_assignment(host, "defer_tail")
     if not defer:
         failures.append("the defer_tail decision is gone")
-    elif "FRAME_FLAG_BYPASS" not in defer.split("== 0")[0]:
+    elif "FRAME_FLAG_BYPASS" not in defer.rsplit("== 0", 1)[0]:
         failures.append("FRAME_FLAG_BYPASS left the defer_tail mask: on bypass "
                         "the presenter would be asked for a token it never "
                         "writes, and 'tail token order failed' exits the "

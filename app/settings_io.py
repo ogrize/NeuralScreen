@@ -15,6 +15,7 @@ truncate the config and lose every setting.
 from __future__ import annotations
 
 from copy import deepcopy
+import time
 import json
 import math
 import os
@@ -402,6 +403,18 @@ CONVERT_QUALITIES = ("high", "balanced", "small")
 CONVERT_IMAGE_FORMATS = ("keep", "png", "jpg")
 
 
+#: A latency reading is this old at most before the badge drops it.
+LATENCY_FRESH_SECONDS = 3.0
+
+
+def fg_user_multiplier(cfg: dict) -> int:
+    """The multiplier the user picked, whatever is running now."""
+    try:
+        return min(FG_MULTIPLIER_MAX, max(2, int(cfg.get("frame_multiplier", 2))))
+    except (TypeError, ValueError, OverflowError):
+        return 2
+
+
 def frame_limit_fps(cfg: dict) -> int:
     """Resolve the persisted limiter mode to an FPS cap; zero is unlimited."""
     mode = str(cfg.get("frame_limit_mode", "unlimited"))
@@ -666,6 +679,13 @@ def _validate_config(cfg: dict) -> dict:
         cfg["frame_multiplier"] = 2
     mode = str(cfg.get("frame_limit_mode", "unlimited"))
     cfg["frame_limit_mode"] = mode if mode in FRAME_LIMIT_MODES else "unlimited"
+    if cfg.get("interlace_mode") not in INTERLACE_MODES:
+        cfg["interlace_mode"] = "every"
+    # The DLSS controls are gone, and an older config must not keep them running.
+    for gone in ("dlss", "dlss_type", "dlss_upscale_nr", "dlaa"):
+        cfg.pop(gone, None)
+    if isinstance(cfg.get("menu_folds"), list):
+        cfg["menu_folds"] = [f for f in cfg["menu_folds"] if f != "dlss"]
     try:
         custom = int(cfg.get("frame_limit_custom", 90))
     except (ValueError, TypeError, OverflowError):
@@ -805,7 +825,8 @@ def _validate_config(cfg: dict) -> dict:
     if passes < 1 or passes > 4:
         _fallback("nr_passes", cfg.get("nr_passes"), 1, "is not 1-4")
         passes = 1
-    cfg["nr_passes"] = passes
+    # Interlacing has its own count, and an older config may hold any other.
+    cfg["nr_passes"] = interlace_passes(cfg) if cfg.get("interlace") is True else passes
     # What passes 2..N should use, if the user gave them their own set. A
     # missing key means "the main set for every pass", which is what every
     # build before this one did - so an untouched config is untouched.
@@ -843,6 +864,8 @@ def _validate_config(cfg: dict) -> dict:
         _fallback("fps_overlay", cfg.get("fps_overlay"), "off",
                   "is not one of off/tl/tr/bl/br")
         cfg["fps_overlay"] = "off"
+    if cfg.get("fps_overlay_corner") not in ("tl", "tr", "bl", "br"):
+        cfg["fps_overlay_corner"] = "tr"
     # The fisheye lens's field of view: a number in degrees inside the range
     # the worker honours. Anything else - a string, NaN - is the default.
     fov = cfg.get("lens_fov", LENS_FOV_DEFAULT)
@@ -990,7 +1013,11 @@ _BOOL_KEYS = (
     "pixels_in_shm", "nr_small", "nr_direct", "frame_generation",
     "record_audio", "rec_indicator", "gpu_record", "convert_audio", "spout",
     "hdr", "open_menu_on_start", "hotkeys_enabled", "keep_speed_when_hidden",
+    "menu_show_pointer",
     "lens", "lens_bend", "fg_ui_protect", "dim_on_rebuild", "window_follow", "nr_on",
+    "interlace", "interlace_blend", "interlace_black", "interlace_clean", "colour", "window_upscale",
+    "lens_nr_only", "colour_nr_only", "nr_hold_repeats", "game_gpu_low",
+    "fg_match_screen", "fps_show_rate", "fps_show_latency", "fps_show_gpu",
 )
 
 # The fisheye lens (native/lens.inl): the game's horizontal field of view, in
@@ -1014,6 +1041,42 @@ LENS_AMOUNT_KEYS = ("lens_vignette", "lens_aberration", "lens_sensor", "lens_sof
 # stops, contrast (the levels about the middle grey), and the white balance as
 # warmth (blue-red) and tint (green-magenta).
 LENS_SIGNED_KEYS = ("lens_saturation", "lens_exposure", "lens_contrast", "lens_warmth", "lens_tint")
+
+
+#: How interlaced NR runs, in the worker's order.
+INTERLACE_MODES = ("every", "half", "alternate")
+
+
+def interlace_passes(cfg: dict) -> int:
+    """The features interlaced NR needs: half-rate runs on the one, and the clean-up
+    pass over the woven picture is a third."""
+    if cfg.get("interlace_mode") == "half":
+        return 1
+    return 3 if cfg.get("interlace_clean") else 2
+
+
+def lens_runs(cfg: dict, paused: bool) -> bool:
+    """Whether the camera's switch and its "Only with NR" allow it right now."""
+    return bool(cfg.get("lens", False)) and not (paused and cfg.get("lens_nr_only") is True)
+
+
+def colour_runs(cfg: dict, paused: bool) -> bool:
+    """Whether the colour's switch and its "Only with NR" allow it right now."""
+    return cfg.get("colour", True) is not False and not (paused and cfg.get("colour_nr_only") is True)
+
+
+def colour_active(cfg: dict) -> bool:
+    """Whether the colour changes the picture: its switch on, a slider off zero."""
+    if cfg.get("colour", True) is False:
+        return False
+    for key in LENS_SIGNED_KEYS:
+        try:
+            if abs(float(cfg.get(key, 0.0))) >= 0.005:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
 
 
 #: The NR model preset (NS_NR_PRESET, the feature's Hint.Render.Preset): the
@@ -1050,7 +1113,7 @@ def nr_preset(cfg: dict) -> str:
 
 
 #: The main page's fold-outs (redesign B, overlay_ui.layout).
-MENU_FOLDS = ("net", "tune", "camera", "colour", "source")
+MENU_FOLDS = ("fg", "interlace", "fps", "net", "tune", "camera", "colour", "source")
 
 
 def restore_menu_extras(menu, cfg: dict) -> None:
@@ -1236,6 +1299,7 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         "rec_indicator": bool(cfg.get("rec_indicator", True)),
         "gpu_record": cfg.get("gpu_record", True) is not False,
         "fps_overlay": str(cfg.get("fps_overlay", "off")),
+        "fps_overlay_corner": str(cfg.get("fps_overlay_corner", "tr")),
         "notifications": str(cfg.get("notifications", "all")),
         "process_priority": str(cfg.get("process_priority", "normal")),
         "lens": bool(cfg.get("lens", False)),
@@ -1256,8 +1320,23 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # for the same reason as the hotkeys switch below - a missing key
         # means the shipped default (on).
         "keep_speed_when_hidden": cfg.get("keep_speed_when_hidden", True) is not False,
+        "menu_show_pointer": cfg.get("menu_show_pointer", True) is not False,
         "fg_ui_protect": bool(cfg.get("fg_ui_protect", False)),
         "dim_on_rebuild": cfg.get("dim_on_rebuild", True) is not False,
+        "interlace": bool(cfg.get("interlace", False)),
+        "interlace_mode": cfg.get("interlace_mode", "every"),
+        "interlace_clean": bool(cfg.get("interlace_clean", False)),
+        "interlace_black": bool(cfg.get("interlace_black", False)),
+        "window_upscale": bool(cfg.get("window_upscale", False)),
+        "interlace_blend": cfg.get("interlace_blend", True) is not False,
+        "colour": cfg.get("colour", True) is not False,
+        "nr_hold_repeats": cfg.get("nr_hold_repeats", True) is not False,
+        "game_gpu_low": bool(cfg.get("game_gpu_low", False)),
+        "fps_show_rate": cfg.get("fps_show_rate", True) is not False,
+        "fps_show_latency": cfg.get("fps_show_latency", True) is not False,
+        "fps_show_gpu": cfg.get("fps_show_gpu", True) is not False,
+        "lens_nr_only": bool(cfg.get("lens_nr_only", False)),
+        "colour_nr_only": bool(cfg.get("colour_nr_only", False)),
         "window_follow": bool(cfg.get("window_follow", False)),
         "nr_on": cfg.get("nr_on", True) is not False,
         "nr_preset": nr_preset(cfg),
@@ -1303,6 +1382,7 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # as soon as one of them works (issue #33).
         "gpu_no_nr": _index_list(cfg.get("gpu_no_nr")),
         "frame_generation": bool(cfg.get("frame_generation", False)),
+        "fg_match_screen": cfg.get("fg_match_screen", True) is not False,
         "frame_multiplier": min(FG_MULTIPLIER_MAX, max(2, int(cfg.get("frame_multiplier", 2)))),
         "frame_limit_mode": (str(cfg.get("frame_limit_mode", "unlimited"))
                              if str(cfg.get("frame_limit_mode", "unlimited"))
@@ -1567,6 +1647,41 @@ def _fg_displayed_fps(st) -> float | None:
     return None
 
 
+def new_pictures_fps(st) -> float | None:
+    """How many new pictures a second the worker reported, while it reports.
+
+    With repeats held this is the rate NR really runs at: the main loop's count
+    holds the repeats too, which is how a 30 fps game read as NR 39.
+    """
+    if latency_ms(st) is None:
+        return None
+    try:
+        return float(st.lat_seen[0].split(" | ", 2)[1].split(" new pictures", 1)[0])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+
+def latency_ms(st) -> float | None:
+    """The worker's latest latency, or None once it has stopped reporting.
+
+    It reports once a second while new pictures reach the screen. A still picture
+    or NR gone to sleep says nothing more, and the last number would stay up.
+    """
+    for line in reversed(st.worker_logs[-200:]):
+        if "[lat] " not in line:
+            continue
+        now = time.monotonic()
+        seen = getattr(st, "lat_seen", None)
+        if seen is None or seen[0] != line:
+            try:
+                value = float(line.split("[lat] ", 1)[1].split(" ms", 1)[0])
+            except (ValueError, IndexError):
+                return None
+            seen = st.lat_seen = (line, now, value)
+        return seen[2] if now - seen[1] <= LATENCY_FRESH_SECONDS else None
+    return None
+
+
 def _fg_active_multiplier(st) -> int | None:
     """The multiplier the presenter is REALLY running, or None while unknown.
 
@@ -1759,7 +1874,11 @@ def menu_payload(st) -> dict:
         "recording_status": str(last_recording.get("status", "")),
         "recording_details": rec_detail,
         "recording_path": str(last_recording.get("path", "")),
-        "work_size": f"{st.work_w}x{st.work_h}",
+        # Asleep, nothing has been resized yet: what the settings will come to.
+        "work_size": ("{}x{}".format(*_work_size(st.width, st.height, st.work_scale,
+                                                 cascade_passes(st)))
+                      if getattr(st, "off_suspended", False)
+                      else f"{st.work_w}x{st.work_h}"),
         "rec_seconds": ((active_recorder.duration_ms / 1000.0)
                         if active_recorder else 0.0),
         "rec_indicator": bool(st.cfg.get("rec_indicator", True)),
@@ -1797,8 +1916,23 @@ def menu_payload(st) -> dict:
         "tray_on_close": bool(st.cfg.get("tray_on_close", False)),
         # #137: the switch's live state, so the panel draws what is in force.
         "keep_speed_when_hidden": st.cfg.get("keep_speed_when_hidden", True) is not False,
+        "menu_show_pointer": st.cfg.get("menu_show_pointer", True) is not False,
         "fg_ui_protect": bool(st.cfg.get("fg_ui_protect", False)),
         "dim_on_rebuild": st.cfg.get("dim_on_rebuild", True) is not False,
+        "interlace": bool(st.cfg.get("interlace", False)),
+        "interlace_mode": st.cfg.get("interlace_mode", "every"),
+        "interlace_clean": bool(st.cfg.get("interlace_clean", False)),
+        "interlace_black": bool(st.cfg.get("interlace_black", False)),
+        "window_upscale": bool(st.cfg.get("window_upscale", False)),
+        "interlace_blend": st.cfg.get("interlace_blend", True) is not False,
+        "colour": st.cfg.get("colour", True) is not False,
+        "nr_hold_repeats": st.cfg.get("nr_hold_repeats", True) is not False,
+        "game_gpu_low": bool(st.cfg.get("game_gpu_low", False)),
+        "fps_show_rate": st.cfg.get("fps_show_rate", True) is not False,
+        "fps_show_latency": st.cfg.get("fps_show_latency", True) is not False,
+        "fps_show_gpu": st.cfg.get("fps_show_gpu", True) is not False,
+        "lens_nr_only": bool(st.cfg.get("lens_nr_only", False)),
+        "colour_nr_only": bool(st.cfg.get("colour_nr_only", False)),
         "window_follow": bool(st.cfg.get("window_follow", False)),
         "nr_preset": nr_preset(st.cfg),
         # #179: the A / B switch only on a runtime that has two models.
@@ -1813,6 +1947,8 @@ def menu_payload(st) -> dict:
         "hdr": bool(st.cfg.get("hdr", False)),
         "motion_backend": st.cfg.get("motion_backend", "nvofa"),
         "frame_generation": bool(st.cfg.get("frame_generation", False)),
+        "fg_match_screen": st.cfg.get("fg_match_screen", True) is not False,
+        "fg_match": __import__("fg_match").status(st),
         "frame_multiplier": min(FG_MULTIPLIER_MAX, max(2, int(st.cfg.get("frame_multiplier", 2)))),
         # The step the presenter is REALLY running, when the runtime refused
         # the requested one and the worker stepped down (issue #100). None

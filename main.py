@@ -139,12 +139,16 @@ from i18n import STRINGS as UI_STRINGS
 import channels
 import commands
 import compatibility_runtime
+import fg_match
+import game_gpu
 import foreign_hooks
 import gpu_recovery
+import gpu_usage
 import power
 import startup
 import settings_io
 import pipeline
+import window_scale
 import pointer
 from pacing import FramePacer, FrameRateMeter
 # The restart cooldown is the loop's business too: it is what the
@@ -545,6 +549,7 @@ class _Pipeline:
         "mon_w",
         "monitor",
         "monitor_devicename",
+        "fg_matcher",
         "motion_attempted",
         "motion_small",
         "next_auto_revive",
@@ -561,9 +566,12 @@ class _Pipeline:
         # Which worker has been told the pass count: the cascade has to be
         # re-sent to every new one (see the main loop).
         "nr_passes_pid",
+        "interlace_restore",
         #: The worker the lens settings were last sent to (LENS): a new one
         #: starts with no lens and is told once, like the pass count.
         "lens_pid",
+        "lens_gate_sent",
+        "lat_seen",
         #: The rate badge's bitmap (app/badge.py) and the worker it was named
         #: to: the worker draws the badge into what it presents (v2.6.0).
         "badge",
@@ -610,6 +618,8 @@ class _Pipeline:
         #: When the queued apply is due: set on every request, so a drag ends
         #: with ONE rebuild instead of one per step (#115).
         "pending_apply_due",
+        "pending_committed",
+        "window_placer",
         "pending_shot",
         "shot_rgba",
         # The screenshot timing marks. Declared here because __slots__ turns an
@@ -832,6 +842,7 @@ def main() -> int:
         frame_pacer = FramePacer()
         last_log = time.monotonic()
         last_fps = 0.0
+        output_fps, output_at, output_from = 0.0, time.monotonic(), 0
         last_perf_log = time.monotonic()
         motion_status = MotionBackendStatus()
         next_housekeeping = 0.0
@@ -855,6 +866,11 @@ def main() -> int:
             down lives in the frame path, which this branch never reaches.
             Both calls below are no-ops when no veil is up.
             """
+            # No readings from before the rest, with the panel open either: the
+            # counter has nothing to say until frames run again.
+            st.display.set_hud({"fps_overlay": str(st.cfg.get("fps_overlay", "off")),
+                                "nr": False, "gpu_ok": st.gpu_ok, "fps": 0.0,
+                                "output_fps": 0.0})
             if st.display.menu.visible:
                 for ev in pygame.event.get():
                     for action in st.display.menu.handle_event(ev):
@@ -901,9 +917,11 @@ def main() -> int:
                 except Exception:
                     pass
 
+        game_gpu.recover()
         while st.running:
             loop_start = time.perf_counter()
             now = time.monotonic()
+            game_gpu.update(st)
 
             # False only when the user asked to quit; a command that raised
             # returns None and the loop goes on (run_contained).
@@ -980,6 +998,7 @@ def main() -> int:
                 continue
 
             if low_cost_off:
+                pipeline.commit_queued_while_off(st)
                 _service_idle_overlay()
                 time.sleep(0.05)
                 continue
@@ -1075,6 +1094,7 @@ def main() -> int:
                         _stand_down(st, "leaving the window mode", exc)
                     continue
                 try:
+                    window_scale.sync(st)
                     pipeline.follow_window(st)
                 except Exception as exc:
                     _stand_down(st, "following the window", exc)
@@ -1215,7 +1235,9 @@ def main() -> int:
             # the program does not fall over.
             try:
                 check_worker(st.worker, st.worker_logs)
-                plain_bypass = bypass and not st.cfg.get("frame_generation", False)
+                # An enlarged window's DLSS reads the motion field as Frame Generation does.
+                plain_bypass = (bypass and not st.cfg.get("frame_generation", False)
+                                and not (st.cfg.get("window_upscale") and st.window_hwnd is not None))
                 hardware_motion = False
                 if st.gray_active and not plain_bypass:
                     was_failed = motion_status.failed and motion_status.worker is st.worker
@@ -1299,7 +1321,7 @@ def main() -> int:
                            bypass=bypass,
                            split=st.split_pos,
                            frame_generation=bool(st.cfg.get("frame_generation", False)),
-                           frame_multiplier=int(st.cfg.get("frame_multiplier", 2)),
+                           frame_multiplier=fg_match.multiplier(st),
                            prepared=bool(st.gray_active) and not worker_scene,
                            early_reply=EARLY_REPLY, worker_scene=worker_scene)
                 _perf("send", t0)
@@ -1679,8 +1701,17 @@ def main() -> int:
             if not bypass:
                 nr_rate.record(completed_at)
             last_fps = nr_rate.rate(completed_at)
+            if not bypass and st.cfg.get("nr_hold_repeats", True) is not False:
+                new_pictures = settings_io.new_pictures_fps(st)
+                if new_pictures is not None:
+                    last_fps = new_pictures
+            # What reaches the screen whatever is running, NR or not.
+            if completed_at - output_at >= 1.0:
+                output_fps = max(0, st.frame_index - output_from) / (completed_at - output_at)
+                output_at, output_from = completed_at, st.frame_index
             st.display.set_hud({
                 "fps": last_fps,
+                "output_fps": output_fps,
                 # NR ON but the worker is not evaluating: the picture is raw.
                 # Without this the only symptom is a counter that runs too fast,
                 # and the user has no way to know the pass stopped.
@@ -1689,6 +1720,15 @@ def main() -> int:
                 # worker reports it every two seconds. The HUD pairs the
                 # network rate with it ("42 / 84 fps"); None while FG is off.
                 "display_fps": settings_io._fg_displayed_fps(st),
+                "latency_ms": settings_io.latency_ms(st),
+                # Only asked for while the counter is up: the reader stops otherwise.
+                "gpu_percent": (gpu_usage.percent()
+                                if str(st.cfg.get("fps_overlay", "off")) != "off"
+                                and st.cfg.get("fps_show_gpu", True) is not False else None),
+                # What the counter shows, from the FPS fold.
+                "fps_show_rate": st.cfg.get("fps_show_rate", True) is not False,
+                "fps_show_latency": st.cfg.get("fps_show_latency", True) is not False,
+                "fps_show_gpu": st.cfg.get("fps_show_gpu", True) is not False,
                 # And which multiplier is really running (issue #100): the
                 # user's pick and the live step can differ after a step-down.
                 "fg_multiplier_active": settings_io._fg_active_multiplier(st),
@@ -1738,6 +1778,10 @@ def main() -> int:
             if (not startup_pending and commands.lens_wanted(st.cfg) and st.worker is not None
                     and getattr(st, "lens_pid", None) != st.worker.pid):
                 commands.send_lens_state(st)
+            # NR has many ways on and off, and "Only with NR" follows them all.
+            elif (not startup_pending and st.worker is not None
+                  and getattr(st, "lens_gate_sent", None) not in (None, commands.lens_gate(st))):
+                commands.send_lens_state(st)
             # The rate badge: drawn by the worker while it presents, so the
             # HUD layer holds nothing that changes (#166). Re-attached every
             # pass, because the display is rebuilt with the window.
@@ -1776,6 +1820,7 @@ def main() -> int:
                     print("[perf] " + " | ".join(parts))
                 last_perf_log = log_now
 
+            fg_match.update(st)
             frame_pacer.wait(settings_io.frame_limit_fps(st.cfg), loop_start)
 
         print("[main] exiting at the user's request")
@@ -1805,6 +1850,16 @@ def main() -> int:
             set_idle_hook(None)
         except Exception:
             pass
+        # The game gets the GPU priority it had.
+        try:
+            game_gpu.release()
+        except Exception as exc:
+            print(f"[main] the game's GPU priority was not put back: {exc}", file=sys.stderr)
+        # A window we kept under the cursor goes back where it was.
+        try:
+            window_scale.stop(st)
+        except Exception as exc:
+            print(f"[main] the enlarged window was not put back: {exc}", file=sys.stderr)
         # A game window we took the frame off gets it back (#176).
         try:
             commands.restore_borderless(st)

@@ -149,12 +149,11 @@ def main() -> int:
                     f"above the first at y={first[1]} - a bottom corner "
                     f"stacks upward")
 
-        # With the panel open the badge stays away: the panel says the same
-        # numbers one line up, and two copies on one screen read as a bug.
+        # On means always there, with the panel open as well (user request).
         disp.menu.set_state({"nr": True, "gpu_ok": True, "fps": 55.1,
                              "display_fps": 167.0})
         disp.set_hud({"fps_overlay": "tl", "fps": 55.1, "display_fps": 167.0})
-        for visible, want_drawn in ((True, False), (False, True)):
+        for visible, want_drawn in ((True, True), (False, True)):
             disp.menu.visible = visible
             disp.screen.fill((0, 0, 0))
             disp._draw_fps_badge()

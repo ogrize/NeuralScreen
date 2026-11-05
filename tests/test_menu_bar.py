@@ -92,7 +92,7 @@ def main() -> int:
         # 1. What the bar holds, and what its clicks do.
         order = [(i.kind, i.key) for i in sorted(menu.items, key=lambda i: i.rect.x)]
         want = [("tile", "nr"), ("tile", "frame_generation"), ("tile", "boost"),
-                ("tile", "lens"), ("button", "screenshot"), ("button", "record"),
+                ("tile", "lens"), ("tile", "colour"), ("button", "screenshot"), ("button", "record"),
                 ("icon", "mini"), ("icon", "min")]
         print(f"    bar: {[k for _, k in order]}, {menu.panel_rect.size}")
         if order != want:

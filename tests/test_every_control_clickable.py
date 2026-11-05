@@ -298,6 +298,12 @@ def main() -> int:
     failures: list[str] = []
     pressed = 0
 
+    # No page may open: the help and channel buttons are controls like any
+    # other here, and each run opened them in the real browser.
+    import webbrowser
+    opened: list = []
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+
     # No process may start: the dispatchers reach `pipeline.start_worker` on
     # several paths (spout, hdr, motion backend), and a real NGX worker would
     # touch the GPU and compete with whatever is on screen.
@@ -420,6 +426,7 @@ def main() -> int:
         print(f"... and {len(failures) - 20} more")
     if failures:
         return 1
+    print(f"    pages the buttons asked for, not opened: {opened}")
     print(f"OK: every control on every page and tab survives a click "
           f"({pressed} actions)")
     return 0

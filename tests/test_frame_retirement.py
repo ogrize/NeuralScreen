@@ -37,7 +37,13 @@ def check_hdr_transition_guard():
     # so deleting both real acquires left the check green (audit:
     # CANNOT-FAIL). The search is anchored to the deferral: only the acquire
     # that actually precedes it counts, and `prepared_` is excluded.
-    decide = source.index('defer_tail = warmup_done')
+    # Window upscale put a condition in front of warmup_done; the deferral
+    # is still this assignment.
+    import re
+    found = re.search(r'defer_tail = [^;]*\bwarmup_done', source)
+    if found is None:
+        raise ValueError('the deferral is gone')
+    decide = found.start()
     before = source[:decide]
     needle = 'got = g_wgc_active ? WgcGrab(v) : DdaGrab(v);'
     acquire = -1

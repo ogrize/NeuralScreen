@@ -623,7 +623,7 @@ _SETTINGS_KEYS = (
     "profile", "style", "auto_mask", "ui_correction",
     "intensity", "local_tone", "local_structure", "skin_structure",
     "work_scale", "nr_small", "motion_backend", "flow_preset",
-    "frame_generation", "frame_multiplier", "frame_limit_mode",
+    "frame_generation", "fg_match_screen", "frame_multiplier", "frame_limit_mode",
     "frame_limit_custom", "hdr", "spout",
     "monitor", "gpu", "gpu_no_nr", "theme", "lang",
     "nr_dll",
@@ -633,7 +633,8 @@ _SETTINGS_KEYS = (
     # counter was, or how big the panel had been made. The section exists to
     # answer "how was the program configured" and had quietly stopped
     # answering it for anything new (found in a reporter's package, #96).
-    "nr_direct", "nr_passes", "residual_strength", "fps_overlay", "notifications",
+    "nr_direct", "nr_passes", "residual_strength", "fps_overlay", "fps_overlay_corner",
+    "notifications",
     "process_priority",
     # The camera bends and tints the whole picture: a report of "everything
     # is warped / clicks miss / the corners are dark" is answered by these.
@@ -649,7 +650,10 @@ _SETTINGS_KEYS = (
     # #137: whether the app asked the OS for full speed while its window is
     # hidden. A report that says "it is slow when minimised" is unanswerable
     # without knowing this switch and what the read-back said.
-    "keep_speed_when_hidden", "fg_ui_protect", "dim_on_rebuild",
+    "keep_speed_when_hidden", "menu_show_pointer", "fg_ui_protect", "dim_on_rebuild", "interlace",
+    "interlace_blend", "interlace_black", "interlace_mode", "interlace_clean", "colour", "window_upscale",
+    "lens_nr_only", "colour_nr_only", "nr_hold_repeats", "game_gpu_low",
+    "fps_show_rate", "fps_show_latency", "fps_show_gpu",
     "window_follow", "nr_preset", "nr_on",
     "hotkeys_enabled",
     "menu_scale", "menu_scale_auto",

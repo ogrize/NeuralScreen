@@ -44,6 +44,7 @@ from protocol import (HEADER_FMT, IDLE_HOOK_INTERVAL, VIDEO_MAGIC,
                       SharedFrameBuffer, WorkerReader, _negotiate_shm,
                       has_idle_hook, idle_sleep, idle_tick, send_dda,
                       send_per_pass, send_resize, send_wgc)
+import window_scale
 from settings_io import (THEME_NAMES, _work_size, cascade_passes, hotkey_labels,
                          nr_verdict)
 from winapi import window_frame_rect
@@ -59,8 +60,8 @@ from winapi import window_frame_rect
 # case - the network never came up and nothing said so).
 #: Always let through: the pipeline diagnostics. NS_PHASE=1 adds the
 #: per-frame profiler lines ([phase]/[pw]) on top of these.
-_LOG_ALWAYS = ("[host]", "[pure]", "[arch]", "[cap]", "[dda]", "[present]",
-               "[spout]", "[wgc]", "[video]", "[hdr]", "[nvofa]", "[fg]", "[stab]", "[lens]", "[badge]",
+_LOG_ALWAYS = ("[lat]", "[host]", "[pure]", "[arch]", "[cap]", "[dda]", "[present]",
+               "[spout]", "[wgc]", "[video]", "[hdr]", "[nvofa]", "[fg]", "[stab]", "[lens]", "[dlss]", "[weave]", "[badge]",
                # Added in 2.0.1. These nine prefixes were emitted by the
                # worker and dropped HERE - not by the worker, which filters
                # nothing. Nine of them, and they are not decoration:
@@ -431,10 +432,16 @@ def wants_low_cost_off(st) -> bool:
 
     Frame Generation still needs a stream of bypass frames.  Recording and a
     pending screenshot are explicit frame consumers too, so they temporarily
-    wake the bypass path even while the NR toggle itself remains off.
+    wake the bypass path even while the NR toggle itself remains off. So are
+    the camera and the colour, which have a picture to change only while
+    frames run.
     """
     return (bool(st.paused)
             and not bool(st.cfg.get("frame_generation", False))
+            and not settings_io.lens_runs(st.cfg, True)
+            and not (settings_io.colour_active(st.cfg) and settings_io.colour_runs(st.cfg, True))
+            and not (st.cfg.get("interlace") and st.cfg.get("interlace_black"))
+            and not (st.cfg.get("window_upscale") and getattr(st, "window_hwnd", None) is not None)
             and st.recorder is None
             and st.pending_shot is None)
 
@@ -1192,6 +1199,16 @@ def resize_window_live(st, frame_w: int, frame_h: int) -> bool:
     return True
 
 
+def apply_window_upscale(st, enabled: bool) -> None:
+    """A small window enlarged to the screen: read once per worker, so a restart."""
+    st.cfg["window_upscale"] = bool(enabled)
+    window_scale.apply_env(st.cfg)
+    settings_io.save_menu_layout(st)
+    print(f"[main] enlarge the window: {'on' if enabled else 'off'} - restarting the worker")
+    teardown_pipeline(st)
+    rebuild_pipeline(st, UI_STRINGS[st.lang].get("settings_applied", "Settings applied"))
+
+
 def apply_hdr(st, enabled: bool) -> None:
     """Toggle HDR compatibility: the worker must be restarted.
 
@@ -1208,6 +1225,7 @@ def apply_hdr(st, enabled: bool) -> None:
     """
     st.cfg["hdr"] = bool(enabled)
     os.environ["NS_HDR"] = "1" if enabled else "0"
+    window_scale.apply_env(st.cfg)
     settings_io.save_menu_layout(st)
     print(f"[main] HDR compatibility: {'on' if enabled else 'off'} - "
           f"restarting the worker")
@@ -1558,7 +1576,7 @@ def follow_window(st) -> None:
     # menu with it) back onto the window every frame, which is the
     # "does not grab, stutters, flickers" report. The position is
     # re-synced on the first frame after the menu closes.
-    if moved and not st.display.menu.visible:
+    if moved and not st.display.menu.visible and not window_scale.following(st):
         st.display.move_to(x, y)
         st.follow_pos = (x, y)
     # Both windows are topmost, and within that group the one raised
@@ -1761,6 +1779,27 @@ def do_restart(st, new_scale: float, new_profile: str, new_params: dict,
     st.work_frame = None  # the indices are reset - a fresh grab is needed
     st.tray._set_state(scale=st.work_scale)
     st.last_restart = time.monotonic()
+
+
+def commit_queued_while_off(st) -> None:
+    """NR OFF idle: the panel and the saved settings take a queued change now.
+
+    The main loop applies nothing while the pipeline sleeps, and the panel draws
+    the running values, so Boost and the sliders did not move until NR came back.
+    Only the state is taken here. The request stays in its slot: the worker hears
+    it, over the RNSZ it needs anyway, when the pipeline wakes.
+    """
+    pending = st.pending_apply
+    if pending is None or getattr(st, "pending_committed", None) is pending:
+        return
+    st.pending_committed = pending
+    st.work_scale, st.cfg["profile"], st.params, small = (pending[0], pending[1],
+                                                          dict(pending[2]), pending[3])
+    if small is not None and small != st.nr_small:
+        st.nr_small = small
+        st.cfg["nr_small"] = small
+        os.environ["NS_NR_SMALL"] = "1" if small else "0"
+    settings_io.save_menu_layout(st)
 
 
 def request_apply(st, new_scale: float, new_profile: str, new_params: dict,

@@ -51,7 +51,7 @@ from settings_io import (CHANNEL_URL, PROFILES, REPO_URL, THEME_NAMES,
                          _autostart_enabled, _next_preset_name,
                          _set_autostart, _work_size, hotkey_labels)
 from tray import tray_labels
-from winapi import give_back_foreground, window_frame_rect, window_under_cursor
+from winapi import foreign_foreground, give_back_foreground, window_frame_rect, window_under_cursor
 
 
 #: ``pending_shot`` has requested one worker frame but has no destination yet.
@@ -902,15 +902,14 @@ def lens_wanted(cfg: dict) -> bool:
     """Whether a worker has to be told LENS: the camera on, or the colour
     moved off zero - the grading runs with the camera off (#164), so a new
     worker that only hears LENS for the camera loses it."""
-    if cfg.get("lens"):
-        return True
-    for key in settings_io.LENS_SIGNED_KEYS:
-        try:
-            if abs(float(cfg.get(key, 0.0))) >= 0.005:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return False
+    return bool(cfg.get("lens") or cfg.get("interlace") or settings_io.colour_active(cfg)
+                or cfg.get("nr_hold_repeats") is False)
+
+
+def lens_gate(st) -> tuple[bool, bool]:
+    """(camera, colour) as they may run now: "Only with NR" follows the NR switch."""
+    paused = bool(getattr(st, "paused", False))
+    return settings_io.lens_runs(st.cfg, paused), settings_io.colour_runs(st.cfg, paused)
 
 
 def send_lens_state(st) -> None:
@@ -924,8 +923,10 @@ def send_lens_state(st) -> None:
     if (getattr(st, "worker_failed", False) or worker is None
             or worker.poll() is not None):
         return
+    # The colour's switch keeps the sliders where they are and sends no change.
+    camera, graded = lens_gate(st)
     try:
-        protocol.send_lens(worker, bool(st.cfg.get("lens", False)),
+        protocol.send_lens(worker, camera,
                            float(st.cfg.get("lens_fov", settings_io.LENS_FOV_DEFAULT)),
                            float(st.cfg.get("lens_noise", settings_io.LENS_NOISE_DEFAULT)),
                            bend=st.cfg.get("lens_bend", True) is not False,
@@ -933,12 +934,20 @@ def send_lens_state(st) -> None:
                            aberration=float(st.cfg.get("lens_aberration", 0.0)),
                            sensor=float(st.cfg.get("lens_sensor", 0.0)),
                            soft=float(st.cfg.get("lens_soft", 0.0)),
-                           saturation=float(st.cfg.get("lens_saturation", 0.0)),
-                           exposure=float(st.cfg.get("lens_exposure", 0.0)),
-                           contrast=float(st.cfg.get("lens_contrast", 0.0)),
-                           warmth=float(st.cfg.get("lens_warmth", 0.0)),
-                           tint=float(st.cfg.get("lens_tint", 0.0)))
+                           saturation=float(st.cfg.get("lens_saturation", 0.0)) if graded else 0.0,
+                           exposure=float(st.cfg.get("lens_exposure", 0.0)) if graded else 0.0,
+                           contrast=float(st.cfg.get("lens_contrast", 0.0)) if graded else 0.0,
+                           warmth=float(st.cfg.get("lens_warmth", 0.0)) if graded else 0.0,
+                           tint=float(st.cfg.get("lens_tint", 0.0)) if graded else 0.0,
+                           interlace=bool(st.cfg.get("interlace", False)),
+                           interlace_blend=st.cfg.get("interlace_blend", True) is not False,
+                           interlace_black=bool(st.cfg.get("interlace_black", False)),
+                           interlace_mode=settings_io.INTERLACE_MODES.index(
+                               st.cfg.get("interlace_mode", "every")),
+                           interlace_clean=bool(st.cfg.get("interlace_clean", False)),
+                           hold_repeats=st.cfg.get("nr_hold_repeats", True) is not False)
         st.lens_pid = worker.pid
+        st.lens_gate_sent = (camera, graded)
     except Exception as exc:
         print(f"[main] the lens settings did not go through ({exc})", file=sys.stderr)
 
@@ -1031,6 +1040,13 @@ def _give_back_focus(st) -> None:
         if give_back_foreground(get_hwnd(), target):
             print(f"[main] menu closed: the foreground goes back to "
                   f"0x{int(target):X}")
+            restore = getattr(st.display, "restore_pointer", None)
+            if restore is not None:
+                restore()
+        else:
+            forget = getattr(st.display, "forget_pointer", None)
+            if forget is not None:
+                forget()
     except Exception as exc:
         print(f"[main] could not give the foreground back: {exc}",
               file=sys.stderr)
@@ -1158,6 +1174,84 @@ def apply_menu_action(st, action: tuple) -> None:
         settings_io.save_menu_layout(st)
         print(f"[main] follow the focused window: "
               f"{'on' if st.cfg['window_follow'] else 'off'}")
+    elif kind == "toggle" and action[1] == "theme":
+        # The tile: the next theme, in the order the Program tab lists them.
+        now = st.cfg.get("theme")
+        at = THEME_NAMES.index(now) if now in THEME_NAMES else -1
+        st.cfg["theme"] = THEME_NAMES[(at + 1) % len(THEME_NAMES)]
+        st.display.menu.set_state({"theme": st.cfg["theme"]})
+        settings_io.save_menu_layout(st)
+        print(f"[main] menu theme -> {st.cfg['theme']}")
+    elif kind == "toggle" and action[1] in ("lens_nr_only", "colour_nr_only"):
+        key = action[1]
+        st.cfg[key] = not bool(st.cfg.get(key, False))
+        st.display.menu.set_state({key: st.cfg[key]})
+        send_lens_state(st)
+        settings_io.save_menu_layout(st)
+        print(f"[main] {key}: {'on' if st.cfg[key] else 'off'}")
+    elif kind == "toggle" and action[1] == "colour":
+        st.cfg["colour"] = st.cfg.get("colour", True) is False
+        st.display.menu.set_state({"colour": st.cfg["colour"]})
+        send_lens_state(st)
+        settings_io.save_menu_layout(st)
+        print(f"[main] colour: {'on' if st.cfg['colour'] else 'off'}")
+    elif kind == "interlace_mode":
+        if action[1] in settings_io.INTERLACE_MODES:
+            st.cfg["interlace_mode"] = action[1]
+            st.display.menu.set_state({"interlace_mode": action[1]})
+            send_lens_state(st)
+            if st.cfg.get("interlace"):
+                st.nr_passes = settings_io.interlace_passes(st.cfg)
+                st.cfg["nr_passes"] = st.nr_passes
+                # Half-rate has no second pass, but a start in it left a saved set
+                # unread: it is back as soon as there is a pass to use it.
+                if st.nr_passes >= 2 and not getattr(st, "nr_pass_params", None):
+                    st.nr_pass_params = settings_io.clean_per_pass(st.cfg.get("nr_pass_params"))
+                pipeline.request_apply(st, *settings_io.queued_apply(st))
+            settings_io.save_menu_layout(st)
+            print(f"[main] interlace mode: {action[1]}")
+    elif kind == "toggle" and action[1] == "interlace_clean":
+        # LENS first: what the resize builds depends on it without Boost.
+        st.cfg["interlace_clean"] = not bool(st.cfg.get("interlace_clean", False))
+        st.display.menu.set_state({"interlace_clean": st.cfg["interlace_clean"]})
+        send_lens_state(st)
+        if st.cfg.get("interlace"):
+            st.nr_passes = settings_io.interlace_passes(st.cfg)
+            st.cfg["nr_passes"] = st.nr_passes
+            pipeline.request_apply(st, *settings_io.queued_apply(st))
+        settings_io.save_menu_layout(st)
+        print(f"[main] clean-up pass: {'on' if st.cfg['interlace_clean'] else 'off'}")
+    elif kind == "toggle" and action[1] == "interlace_black":
+        st.cfg["interlace_black"] = not bool(st.cfg.get("interlace_black", False))
+        st.display.menu.set_state({"interlace_black": st.cfg["interlace_black"]})
+        send_lens_state(st)
+        settings_io.save_menu_layout(st)
+        print(f"[main] black lines: {'on' if st.cfg['interlace_black'] else 'off'}")
+    elif kind == "toggle" and action[1] == "interlace_blend":
+        st.cfg["interlace_blend"] = st.cfg.get("interlace_blend", True) is False
+        st.display.menu.set_state({"interlace_blend": st.cfg["interlace_blend"]})
+        send_lens_state(st)
+        settings_io.save_menu_layout(st)
+        print(f"[main] blend the rows: {'on' if st.cfg['interlace_blend'] else 'off'}")
+    elif kind == "toggle" and action[1] == "interlace":
+        # A LENS field: the worker weaves two NR passes, Boost or not, and with
+        # NR off nothing changes. Off puts back the count it found, if it was
+        # switched on in this session.
+        st.cfg["interlace"] = not bool(st.cfg.get("interlace", False))
+        st.display.menu.set_state({"interlace": st.cfg["interlace"]})
+        send_lens_state(st)
+        if st.cfg["interlace"]:
+            st.interlace_restore = int(getattr(st, "nr_passes", 1) or 1)
+            passes = settings_io.interlace_passes(st.cfg)
+        else:
+            passes = (getattr(st, "interlace_restore", None)
+                      or int(getattr(st, "nr_passes", 1) or 1))
+            st.interlace_restore = None
+        st.nr_passes = passes
+        st.cfg["nr_passes"] = passes
+        pipeline.request_apply(st, *settings_io.queued_apply(st))
+        settings_io.save_menu_layout(st)
+        print(f"[main] interlace: {'on' if st.cfg['interlace'] else 'off'}")
     elif kind == "toggle" and action[1] == "dim_on_rebuild":
         st.cfg["dim_on_rebuild"] = not (st.cfg.get("dim_on_rebuild", True) is not False)
         st.display.dim_on_rebuild = st.cfg["dim_on_rebuild"]
@@ -1171,6 +1265,30 @@ def apply_menu_action(st, action: tuple) -> None:
         st.display.menu.set_state({"fg_ui_protect": st.cfg["fg_ui_protect"]})
         print(f"[main] FG interface protection: "
               f"{'on' if st.cfg['fg_ui_protect'] else 'off'}")
+    elif kind == "toggle" and action[1] == "game_gpu_low":
+        # The main loop's game_gpu.update acts on it within half a second.
+        st.cfg["game_gpu_low"] = not bool(st.cfg.get("game_gpu_low", False))
+        st.display.menu.set_state({"game_gpu_low": st.cfg["game_gpu_low"]})
+        settings_io.save_menu_layout(st)
+        print(f"[main] NR ahead of the game: {'on' if st.cfg['game_gpu_low'] else 'off'}")
+    elif kind == "toggle" and action[1] in ("fps_show_rate", "fps_show_latency", "fps_show_gpu"):
+        # What the frame counter shows; the next frame's HUD carries it.
+        key = action[1]
+        st.cfg[key] = st.cfg.get(key, True) is False
+        st.display.menu.set_state({key: st.cfg[key]})
+        settings_io.save_menu_layout(st)
+        print(f"[main] frame counter {key[9:]}: {'shown' if st.cfg[key] else 'hidden'}")
+    elif kind == "toggle" and action[1] == "nr_hold_repeats":
+        st.cfg["nr_hold_repeats"] = st.cfg.get("nr_hold_repeats", True) is False
+        st.display.menu.set_state({"nr_hold_repeats": st.cfg["nr_hold_repeats"]})
+        send_lens_state(st)
+        settings_io.save_menu_layout(st)
+        print(f"[main] match game frames: {'on' if st.cfg['nr_hold_repeats'] else 'off'}")
+    elif kind == "toggle" and action[1] == "menu_show_pointer":
+        st.cfg["menu_show_pointer"] = st.cfg.get("menu_show_pointer", True) is False
+        st.display.menu.set_state({"menu_show_pointer": st.cfg["menu_show_pointer"]})
+        settings_io.save_menu_layout(st)
+        print(f"[main] show the mouse on open: {'on' if st.cfg['menu_show_pointer'] else 'off'}")
     elif kind == "toggle" and action[1] == "keep_speed_when_hidden":
         # #137: the background-speed opt-out. Applied at once rather than at
         # the next frame loop tick, so the switch and the two processes never
@@ -1223,6 +1341,11 @@ def apply_menu_action(st, action: tuple) -> None:
         if st.cfg["frame_generation"]:
             st.fg_alerted = False
         settings_io.save_menu_layout(st)
+    elif kind == "toggle" and action[1] == "fg_match_screen":
+        st.cfg["fg_match_screen"] = st.cfg.get("fg_match_screen", True) is False
+        st.display.menu.set_state({"fg_match_screen": st.cfg["fg_match_screen"]})
+        settings_io.save_menu_layout(st)
+        print(f"[main] FG match the screen: {'on' if st.cfg['fg_match_screen'] else 'off'}")
     elif kind == "frame_multiplier":
         st.cfg["frame_multiplier"] = min(settings_io.FG_MULTIPLIER_MAX, max(2, int(action[1])))
         # A different multiplier is a fresh attempt at the feature: if the
@@ -1253,6 +1376,8 @@ def apply_menu_action(st, action: tuple) -> None:
         # so the toggle goes through a worker restart (pipeline.apply_spout
         # owns the whole path, including the config write).
         pipeline.apply_spout(st, not bool(st.cfg.get("spout", False)))
+    elif kind == "toggle" and action[1] == "window_upscale":
+        pipeline.apply_window_upscale(st, not bool(st.cfg.get("window_upscale", False)))
     elif kind == "toggle" and action[1] == "hdr":
         # HDR compatibility: NS_HDR is read once per worker process too,
         # and it decides the capture format, so this is a restart as well.
@@ -1283,8 +1408,10 @@ def apply_menu_action(st, action: tuple) -> None:
                    settings_io.PER_PASS_KEYS},
                 # What passes 2+ ran with until now: the main set without its
                 # local tone, which darkens again on every pass. Switching
-                # the set on must not change the picture by itself.
-                "local_tone": 0.0,
+                # the set on must not change the picture by itself. Interlaced,
+                # the second pass ran the whole profile, as a pass beside the first.
+                "local_tone": (float(seeded.get("local_tone", 0.0))
+                               if st.cfg.get("interlace") else 0.0),
             }
             st.cfg["nr_pass_params"] = dict(st.nr_pass_params)
             print(f"[main] per-pass parameters on, seeded from the main set: "
@@ -1523,6 +1650,16 @@ def apply_menu_action(st, action: tuple) -> None:
         st.cfg["notifications"] = level
         st.display.set_alert_level(level)
         print(f"[main] pop-up notifications -> {level}")
+    elif kind == "toggle" and action[1] == "fps_overlay":
+        # The tile: back in the corner it was last in.
+        now = str(st.cfg.get("fps_overlay", "off"))
+        if now != "off":
+            st.cfg["fps_overlay_corner"] = now
+        st.cfg["fps_overlay"] = ("off" if now != "off"
+                                 else str(st.cfg.get("fps_overlay_corner", "tr")))
+        st.display.menu.set_state({"fps_overlay": st.cfg["fps_overlay"]})
+        settings_io.save_menu_layout(st)
+        print(f"[main] on-screen frame counter -> {st.cfg['fps_overlay']}")
     elif kind == "fps_overlay":
         corner = str(action[1])
         if corner not in ("off", "tl", "tr", "bl", "br"):
@@ -1530,6 +1667,8 @@ def apply_menu_action(st, action: tuple) -> None:
                   file=sys.stderr)
             return
         st.cfg["fps_overlay"] = corner
+        if corner != "off":
+            st.cfg["fps_overlay_corner"] = corner
         print(f"[main] on-screen frame counter -> {corner}")
     elif kind == "menu_scale":
         # The menu has already applied it to itself. It lands in st.cfg here
@@ -1844,6 +1983,12 @@ def drain_commands(st) -> bool:
                 # and make NeuralScreen appear to hide itself (#87).
                 st.display.menu.set_state(settings_io.menu_payload(st))
                 was_open = st.display.menu.visible
+                # The main loop's sampling sleeps with NR off, and the close has
+                # to know where to give the foreground back.
+                if not was_open:
+                    foreign = foreign_foreground()
+                    if foreign:
+                        st.last_foreground = foreign
                 if cmd == "show_settings":
                     st.display.menu.visible = True
                     opened = True
@@ -1907,6 +2052,14 @@ def drain_commands(st) -> bool:
                     st.display.follow_taskbar_desktop()
                     st.display.raise_topmost()
                     st.display.draw_overlay(0.0)
+                    # Only the panel, and only an open that was asked for: the
+                    # bar leaves the game its keyboard, and the close below
+                    # hands the foreground back to the game.
+                    if (not was_open and not getattr(st.display.menu, "mini", False)
+                            and st.cfg.get("menu_show_pointer", True) is not False):
+                        shown = st.display.force_pointer_visible()
+                        print(f"[main] the panel opened: pointer "
+                              f"{'shows' if shown else 'still hidden'}")
                 else:
                     # The menu closed: put the HUD layer back on the
                     # captured window.
@@ -2004,6 +2157,10 @@ def drain_commands(st) -> bool:
                 st.display.alert(UI_STRINGS[st.lang].get(
                     "lens_on" if st.cfg.get("lens") else "lens_off",
                     "Camera ON" if st.cfg.get("lens") else "Camera OFF"))
+            elif cmd in ("nr_passes_up", "nr_passes_down") and st.cfg.get("interlace"):
+                # "NR runs" decides the count while interlacing: a key must not
+                # undo it behind a control that is not on the panel.
+                print("[main] NR passes follow the interlace mode - the key does nothing")
             elif cmd in ("nr_passes_up", "nr_passes_down"):
                 # The NR cascade one pass up or down (#126), through the same
                 # action the panel's control takes.

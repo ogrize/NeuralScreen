@@ -38,7 +38,7 @@ def _menu():
         "window_mode": False,
     })
     menu.visible = True
-    menu.folds = {"net", "tune", "camera", "source"}   # every fold-out open (v2.6.0)
+    menu.folds = {"fg", "interlace", "net", "tune", "camera", "source"}   # every fold-out open (v2.6.0)
     menu.user_height = 360
     menu.draw(pygame.Surface((1280, 720)))
     return menu

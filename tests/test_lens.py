@@ -179,11 +179,12 @@ def _pipe_run(failures: list) -> None:
     def lens(on: bool, fov: float, noise: float = 0.0, bend: bool = True,
              vignette: float = 0.0, aberration: float = 0.0, sensor: float = 0.0,
              soft: float = 0.0, saturation: float = 0.0, exposure: float = 0.0,
-             contrast: float = 0.0, warmth: float = 0.0, tint: float = 0.0) -> None:
+             contrast: float = 0.0, warmth: float = 0.0, tint: float = 0.0,
+             interlace: float = 0.0) -> None:
         proc.stdin.write(struct.pack(LENS_FMT, LENS_MAGIC,
                                      lens_flags(on, bend, vignette, aberration, sensor, soft),
                                      fov, noise, 0, saturation, exposure, contrast, warmth,
-                                     tint, 0.0))
+                                     tint, interlace))
         proc.stdin.flush()
         magic, ok, _r0, _r1, _pts = struct.unpack(
             LENS_ACK_FMT, read_reply(proc.stdout, struct.calcsize(LENS_ACK_FMT)))
@@ -238,6 +239,19 @@ def _pipe_run(failures: list) -> None:
         warmed = frame(grey)
         lens(True, FOV, bend=False, contrast=-1.0)
         flattened = frame(steps)
+        # Interlacing with NR off: no black lines, the output is the input.
+        lens(False, FOV, interlace=1.0)
+        if not np.array_equal(frame(grey)[..., :3], grey[..., :3]):
+            failures.append("with NR off, the interlace switch changed the picture")
+        # Show black lines: bit 0 and bit 6 of the same field. One field black and
+        # the other untouched, and the other way round on the next frame.
+        lens(False, FOV, interlace=65.0)
+        first, second = frame(grey), frame(grey)
+        black_row = 0 if first[0, 0, 0] == 0 else 1
+        if not (np.all(first[black_row::2, :, :3] == 0) and np.all(first[1 - black_row::2, :, :3] == 160)):
+            failures.append("black lines: one field is not black with the other untouched")
+        if not (np.all(second[1 - black_row::2, :, :3] == 0) and np.all(second[black_row::2, :, :3] == 160)):
+            failures.append("black lines: the next frame did not take the other lines")
         lens(False, FOV)
         after = frame()
         if not np.array_equal(after[..., :3], rgba[..., :3]):
